@@ -1,0 +1,29 @@
+# nostromo — the coordination pack this city owns.
+#
+# Named for the Nostromo, matching the sysadmin rig's Alien-crew identity
+# convention (muthur, ripley, parker, bishop, jonesy).
+#
+# Scope: coordination only. The gastown pack keeps the throughput layer
+# (polecat / witness / refinery) because those files carry hard-won
+# correctness fixes — pushed-ref verification before refinery handoff,
+# worktree-safe direct merges, formula-step claim behaviour — and forking
+# them means owning those race conditions permanently. This city has
+# rejected gastown's *coordination* layer wholesale (boot forked, deacon
+# on_demand, dog disabled) while keeping its *throughput* layer nearly
+# stock. That asymmetry is why the split runs here.
+#
+# Design record: sysadmin repo,
+#   docs/superpowers/specs/2026-07-27-dallas-rig-coordinator-design.md
+#
+# Contents:
+#   agents/dallas   attended rig coordinator for the sysadmin rig (Phase 1)
+#
+# Planned (spec §9, not yet here):
+#   agents/mayor    Phase 2 — the shrunk city coordinator
+#   formulas/       Phase 3b — the four sysadmin formulas, currently
+#                   untracked in the city's formulas_dir
+
+[pack]
+name = "nostromo"
+version = "0.1.0"
+schema = 2

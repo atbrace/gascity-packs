@@ -1,0 +1,34 @@
+# dallas — the Nostromo's captain. Austin's persistent attended chat interface
+# for the sysadmin rig: the delegator he talks to day to day. Owns the rig
+# inbox (receives escalations from the pool), routes work to the right
+# identity, and maintains rig-local config. Distinct from jonesy, which stays
+# the hands-on Opus lane.
+#
+# scope = "city" + dir = "sysadmin": nostromo is imported at the CITY level
+# (gc/pack.toml), and `dir` binds this single instance to the sysadmin rig
+# directory — the same shape as the city's hand-rolled gc/agents/jonesy. That
+# `dir` is the structural win: dallas loads sysadmin/CLAUDE.md natively and its
+# `bd` writes land in the `sys` store, not HQ. Declaring the scope explicitly
+# (rather than leaving it unscoped, which is included in BOTH expansions) keeps
+# dallas from being instantiated per-rig if nostromo is ever added to a rig
+# import.
+#
+# Identity note: pack-imported agents carry the import key as a binding prefix,
+# so this agent stamps `sysadmin/nostromo.dallas` — not `sysadmin/dallas`. Use
+# the qualified name everywhere (sessions, mail, formula targets).
+scope = "city"
+dir = "sysadmin"
+provider = "claude"
+default_sling_formula = "mol-do-work"
+
+# effort = "medium" rather than jonesy's "low": routing and triage judgment is
+# the entire job.
+option_defaults = { model = "opus-5-1m", effort = "medium" }
+
+# ⚠️ SINGLE-IDENTITY LANE. The requirement is ONE persistent attended session,
+# started by hand: `gc session new sysadmin/nostromo.dallas`.
+# NEVER point an order or formula `pool =` at dallas — same containment rule
+# Austin wrote for ripley on 2026-07-22. A pool reference would spawn
+# unattended coordinator sessions, which is the one thing this agent must not
+# be.
+max_active_sessions = 1
