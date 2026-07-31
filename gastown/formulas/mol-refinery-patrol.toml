@@ -27,6 +27,35 @@ In `mr` mode, refinery treats PR publication as the terminal handoff for
 the direct-bead workflow: it records the PR URL on the work bead and
 closes the bead once the PR is verified.
 
+## The hold contract
+
+`label:hold` on a bead means a human has parked it: **do not advance it.**
+The label is the contract — not a dependency blocker, not a metadata flag.
+A blocker does not help here because this formula finds work by `--assignee`
+rather than through `gc bd ready`, so dependency gating never runs; a parallel
+`metadata.hold` would be a second mechanism competing with the established
+label one.
+
+**Hold must be checked at EVERY point a bead advances state, not just at
+dispatch.** Auto-sling honoring the label protects only the front door. The
+merge path is the back door, and it is the irreversible one: on 2026-07-31 a
+refinery merged `sys-zmpre` to main while the bead carried `label:hold`,
+arming a recurring order a human had deliberately disarmed three days earlier.
+Nothing in the merge path read labels at all.
+
+Two guards, both required:
+
+1. **find-work** filters held beads out of selection (`--exclude-label hold`).
+2. **merge-push** re-reads labels from the ledger before every state advance —
+   the already-merged close, the direct push, and the `mr` branch push — via
+   `refuse_if_held`. Guard 1 alone is not enough: a hold applied *after* the
+   bead was claimed is exactly the race that bit us, and merge is the last
+   point where stopping is still cheap.
+
+A refused merge is not a failure of the work. The branch is preserved, the
+bead returns to the pool unrouted, and mayor is notified. Clearing the hold
+is a human act.
+
 Read each step's description before acting — Config values override defaults."""
 formula = "mol-refinery-patrol"
 
@@ -172,7 +201,7 @@ description = """
 Search for work beads assigned to you with branch metadata:
 ```bash
 WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open \
-  --exclude-type=epic --has-metadata-key=branch --limit=1 --json | jq -r '.[0].id // empty')
+  --exclude-type=epic --exclude-label hold --has-metadata-key=branch --limit=1 --json | jq -r '.[0].id // empty')
 ```
 
 `${GC_RIG:+--rig="$GC_RIG"}` scopes the query to this refinery's rig
@@ -180,6 +209,11 @@ database. Without it, `gc bd list` routes to the HQ database and never
 sees rig-scoped work beads — the `assignee` field alone does not route
 by namespace. For HQ-only refineries `$GC_RIG` is empty and the flag
 expands to nothing.
+
+`--exclude-label hold` is the first of the two hold guards (see **The
+hold contract** in this formula's description). Selecting by `--assignee`
+bypasses `gc bd ready`, so a dependency blocker does not gate this query —
+the label is the only signal that reaches it. Never drop this flag.
 
 If found: read the bead metadata to confirm it has a branch:
 ```bash
@@ -470,6 +504,91 @@ Target: $TARGET"
   exit 1
 }
 
+pour_next_and_burn() {
+  # End this patrol iteration cleanly: pour + assign the next wisp, then burn
+  # the current one. Every exit path from the loop owes this, or the refinery
+  # stops patrolling. Returns non-zero if it could not complete, so callers
+  # stop rather than burn a wisp with no successor.
+  pnb_current=${GC_BEAD_ID:-}
+  if [ -z "$pnb_current" ]; then
+    pnb_current=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
+  fi
+  if [ -z "$pnb_current" ]; then
+    echo "Could not resolve current wisp; not burning."
+    return 1
+  fi
+  pnb_next=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+  if [ -z "$pnb_next" ]; then
+    echo "Could not pour next refinery wisp; not burning."
+    return 1
+  fi
+  if ! gc bd update "$pnb_next" --assignee="$GC_AGENT"; then
+    echo "Could not assign next refinery wisp; not burning."
+    return 1
+  fi
+  gc bd mol burn "$pnb_current" --force
+}
+
+refuse_if_held() {
+  # Hold guard #2 (see **The hold contract** in this formula's description).
+  # `label:hold` is the human "do not advance this bead" contract. find-work
+  # already excludes held beads, but a hold applied AFTER the bead was claimed
+  # is exactly the race that landed sys-zmpre on 2026-07-31 — so re-read the
+  # labels from the ledger at every point this step advances bead state, not
+  # just once at selection.
+  #
+  # On hold: take the reject branch. Bead back to the pool (open, unassigned)
+  # with a rejection_reason, pool demand cleared so nothing re-dispatches it,
+  # branch PRESERVED (the work is fine, the timing is not), mayor escalated.
+  # Fail closed on an unreadable bead. `gc bd show` can exit 0 while returning
+  # an error object, so a bare `.[0].labels` probe would silently evaluate to
+  # "no hold" and wave the merge through — a guard that fails open is not a
+  # guard. Demand a well-formed record before trusting either answer.
+  rih_json=$(gc bd show "$WORK" --json 2>/dev/null) || rih_json=""
+  rih_hold=$(printf '%s\n' "$rih_json" \
+    | jq -r 'if type == "array" and ((.[0].id? // "") != "")
+             then (((.[0].labels // []) | index("hold")) != null)
+             else "unknown" end' 2>/dev/null || echo unknown)
+  case "$rih_hold" in
+    false) return 0 ;;   # verified unheld -> caller proceeds
+    true)  : ;;          # held -> fall through to the reject branch
+    *)
+      echo "Could not read labels for $WORK — gc bd show returned no usable record. Fail closed: refusing to advance. STOP. Do not mutate bead state."
+      gc runtime drain-ack
+      exit 1
+      ;;
+  esac
+
+  # Explicit status checks, not `set -e` — this function is called from inside
+  # the merge script, where an unchecked failure would abort mid-refusal and
+  # leave no record of why. Refusal stands either way: we never reach a push.
+  if ! gc bd update "$WORK" \
+    --status=open \
+    --assignee="" \
+    --set-metadata rejection_reason="held (label:hold) — not merged" \
+    --unset-metadata gc.routed_to; then
+    echo "Could not return held bead $WORK to the pool. The merge is refused regardless; bead state needs a human. STOP."
+    gc runtime drain-ack
+    exit 1
+  fi
+  echo "REFUSED: $WORK carries label:hold. Branch $BRANCH preserved; bead returned to the pool unrouted."
+  echo "STOP. A human must clear the hold before this bead can advance."
+  gc mail send mayor/ -s "ESCALATION: refused merge of held bead $WORK" -m "Refinery refused to advance $WORK because it carries label:hold.
+
+Work bead: $WORK
+Branch: $BRANCH (preserved — NOT deleted)
+Target: $TARGET
+Merge strategy: $MERGE_STRATEGY
+
+Bead returned to the pool: status=open, assignee cleared, gc.routed_to
+unset so nothing re-dispatches it while the hold stands. Clear the hold
+(remove label:hold) to let this work resume." \
+    || echo "WARNING: could not mail mayor about the refused merge of $WORK."
+  pour_next_and_burn || true
+  gc runtime drain-ack
+  exit 1
+}
+
 branch_has_real_change() {
   # Shared false-completion predicate (0-diff/0-commit guard). Does
   # <branch-ref> introduce a real change vs its merge-base with
@@ -700,7 +819,15 @@ one), exactly like a normal merge. Only genuine errors drain-ack.
   Legit no-op resolutions use wontfix/duplicate/not-planned, never merged — so
   this never blocks a real merge.
 
+The hold re-check comes first: the already-merged path below **closes** the
+bead, which is a state advance like any other. A held bead whose commits
+already reached `$TARGET` — precisely the shape left behind by a revert, since
+reverting does not remove the original commit from history — would otherwise be
+closed as merged while the human's hold still stands.
+
 ```bash
+refuse_if_held
+
 FORK_SHA=$(gc bd show "$WORK" --json | jq -r '.[0].metadata.fork_sha // empty')
 if ! git fetch origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"; then
   echo "git fetch failed; cannot evaluate merge state. STOP. Do not mutate bead state."
@@ -788,6 +915,12 @@ git worktree add --detach "$MERGE_WT" "origin/$TARGET"
 git -C "$MERGE_WT" merge --ff-only "$TEMP_SHA"
 MERGED_SHA=$(git -C "$MERGE_WT" rev-parse HEAD)
 MERGED_SHORT=$(git -C "$MERGE_WT" rev-parse --short HEAD)
+
+# Last cheap stop. Everything above is local and discardable; the next line
+# is not. Re-read label:hold against the ledger here, not earlier — a hold
+# applied while this script was fetching and merging is still honored.
+refuse_if_held
+
 git -C "$MERGE_WT" push origin "HEAD:$TARGET"
 
 git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"
@@ -849,7 +982,13 @@ esac
 ```
 
 **1. Push the rebased branch back to origin:**
+
+PR publication is this strategy's terminal handoff — it closes the work bead —
+so the same hold re-check gates it. Run it immediately before the push, after
+the 0-diff guard above.
 ```bash
+refuse_if_held
+
 git checkout temp
 git push origin HEAD:$BRANCH --force-with-lease
 ```
