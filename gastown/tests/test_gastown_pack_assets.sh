@@ -293,6 +293,92 @@ if violations:
 PY
 }
 
+test_refinery_patrol_is_bounded_by_merge_count() {
+    local formula
+    formula="$GASTOWN/formulas/mol-refinery-patrol.toml"
+
+    # A wisp bounds the WORK ITEM, not the process: pouring the next wisp keeps
+    # the same conversation, so every prior merge stays in context. A refinery
+    # was measured at 606,783 tokens over 23h16m with zero compactions. That is
+    # a correctness problem — handle-failures asks the refinery to judge whether
+    # a failure is a branch regression or pre-existing on target, and that
+    # judgement's inputs drift as context grows.
+    grep -F '[vars.max_merges_per_session]' "$formula" >/dev/null ||
+        fail "mol-refinery-patrol must declare max_merges_per_session"
+    grep -F '[vars.merges_this_session]' "$formula" >/dev/null ||
+        fail "mol-refinery-patrol must declare merges_this_session"
+    grep -F 'MERGES_DONE=$(( {{merges_this_session}} + 1 ))' "$formula" >/dev/null ||
+        fail "next-iteration must count the merge it just completed"
+    grep -F 'gc runtime request-restart' "$formula" >/dev/null ||
+        fail "next-iteration must restart the process once the bound is reached"
+
+    # Ordering is load-bearing: pour, assign, burn, THEN restart. Restarting
+    # before the successor is poured and assigned brings the refinery back with
+    # an empty hook and stops the patrol (upstream sys-x3g8i is that bug in
+    # mol-witness-patrol). Assert the restart is the LAST thing next-iteration
+    # does, after the burn.
+    python3 - "$formula" <<'PY' || fail "next-iteration must restart only after pour+assign+burn"
+import pathlib
+import re
+import sys
+import tomllib
+
+formula = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+step = next(s for s in formula["steps"] if s["id"] == "next-iteration")
+
+# Only executable lines count. The step's prose also names these commands while
+# explaining them, and prose that trails the code would satisfy any ordering
+# check run over the raw description.
+code = "\n".join(re.findall(r"```bash\n(.*?)```", step["description"], re.S))
+
+burn = code.rfind('gc bd mol burn "$CURRENT_WISP" --force')
+assign = code.rfind('gc bd update "$NEXT" --assignee="$GC_AGENT"')
+pour = code.rfind("gc bd mol wisp mol-refinery-patrol")
+restart = code.rfind("gc runtime request-restart")
+
+missing = [n for n, i in (("pour", pour), ("assign", assign), ("burn", burn),
+                          ("restart", restart)) if i < 0]
+if missing:
+    raise SystemExit("next-iteration is missing: " + ", ".join(missing))
+if not pour < assign < burn < restart:
+    raise SystemExit(
+        "next-iteration order must be pour < assign < burn < restart; got "
+        f"pour={pour} assign={assign} burn={burn} restart={restart}"
+    )
+PY
+
+    # Every executable pour must thread the counter. A pour that omits it falls
+    # back to the default (0), so the bound silently never fires on that path —
+    # the same class of invisible regression this bound exists to prevent. The
+    # bootstrap pour in the formula description is exempt: it is the FIRST pour
+    # and correctly starts at the default, and it lives outside a bash fence.
+    python3 - "$formula" <<'PY' || fail "a refinery pour does not thread merges_this_session"
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+open_fence = re.compile(r"^\s*```bash\s*$")
+close_fence = re.compile(r"^\s*```\s*$")
+
+violations = []
+in_block = False
+for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    if not in_block:
+        in_block = bool(open_fence.match(line))
+        continue
+    if close_fence.match(line):
+        in_block = False
+        continue
+    if "gc bd mol wisp mol-refinery-patrol" in line and "--var merges_this_session=" not in line:
+        violations.append(f"{path.name}:{number}: {line.strip()}")
+
+if violations:
+    print("\n".join(violations))
+    raise SystemExit(1)
+PY
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_shutdown_dance_contracts_are_executable
@@ -302,5 +388,6 @@ test_polecat_startup_uses_standard_hook_claim
 test_review_leg_contract_forbids_synthetic_mutation
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
 test_next_iteration_excludes_current_wisp_from_successor_queries
+test_refinery_patrol_is_bounded_by_merge_count
 
 echo "gastown pack asset tests passed"

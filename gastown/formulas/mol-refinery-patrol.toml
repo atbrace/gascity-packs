@@ -5,8 +5,10 @@ Refinery patrol loop. Poured as a root-only wisp on startup:
   gc bd update $WISP --assignee=$GC_AGENT
 
 Each wisp is ONE iteration: check for work, merge one branch, pour
-the next iteration. On crash, re-read the formula steps and determine
-where you left off from context (git state, bead state, last action).
+the next iteration. A wisp bounds the WORK ITEM, not the process — see
+**The session bound** below for what bounds the process. On crash,
+re-read the formula steps and determine where you left off from context
+(git state, bead state, last action).
 
 Formula steps are NOT materialized as child beads. Read the step
 descriptions below and work through them in order.
@@ -55,6 +57,34 @@ Two guards, both required:
 A refused merge is not a failure of the work. The branch is preserved, the
 bead returns to the pool unrouted, and mayor is notified. Clearing the hold
 is a human act.
+
+## The session bound
+
+**A wisp is a work-item boundary, not a process boundary.** Pouring the next
+wisp does not start a new session — the same conversation keeps going, and
+every merge it has ever done stays in context. Nothing else bounds that:
+`wake_mode="fresh"` needs a two-hour idle gap that a live queue may never give,
+the context nudge is advisory, and the progress-stall recycler does not fire on
+a refinery that is merging steadily. A refinery was measured at 606,783 tokens
+across 23h16m with zero compactions.
+
+That is a correctness problem, not a cost one. The `handle-failures` step asks
+the refinery to judge whether a test failure is a branch regression or
+pre-existing on target. That judgement's inputs drift as context grows, so the
+same branch can plausibly get a different verdict at hour 1 than at hour 23,
+and nothing makes it reproducible.
+
+So `next-iteration` counts completed merges and, after
+`max_merges_per_session`, restarts the process instead of pouring into it.
+The count rides on `merges_this_session`, threaded through every pour: early
+exits (rejection, refusal, no work) carry it unchanged because they merged
+nothing, and the restart path resets it to 0. An unplanned restart leaves the
+count high, which just means the next bound arrives early — the safe direction.
+
+**Ordering is load-bearing: pour, assign, burn, THEN restart.** Restarting
+before the next wisp is poured and assigned brings the refinery back with an
+empty hook and stops the patrol (upstream sys-x3g8i is exactly that bug in
+mol-witness-patrol).
 
 Read each step's description before acting — Config values override defaults."""
 formula = "mol-refinery-patrol"
@@ -107,6 +137,14 @@ default = "false"
 description = "Seconds to sleep before re-checking for work. Replaces former event-watch loop which hot-spun on cache-reconcile firehose."
 default = "60"
 
+[vars.max_merges_per_session]
+description = "Merges to complete before handing off and restarting with fresh context. 0 disables the bound (unbounded — the pre-2026-08 behaviour)."
+default = "5"
+
+[vars.merges_this_session]
+description = "Merges this process has already completed, threaded through each pour. Internal loop state — callers pour the first wisp without it; next-iteration maintains it."
+default = "0"
+
 [[steps]]
 id = "validate-identity"
 title = "Validate canonical agent identity"
@@ -150,7 +188,10 @@ CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
   CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
 fi
-NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+# merges_this_session=0: a restart follows, so the successor wisp is read by a
+# fresh process with an empty context. Carrying the old count would bound that
+# new process against merges it never saw.
+NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --var merges_this_session=0 --json | jq -r '.new_epic_id // empty')
 if [ -z "$NEXT" ]; then
   echo "Could not pour next refinery wisp; not requesting restart."
   gc runtime drain-ack
@@ -278,7 +319,8 @@ CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
   CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
 fi
-NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+# Nothing merged, so the session bound carries unchanged.
+NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --var merges_this_session={{merges_this_session}} --json | jq -r '.new_epic_id // empty')
 if [ -z "$NEXT" ]; then
   echo "Could not pour next refinery wisp; not burning."
   gc runtime drain-ack
@@ -379,7 +421,8 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
      if [ -z "$CURRENT_WISP" ]; then
        CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
      fi
-     NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+     # Nothing merged, so the session bound carries unchanged.
+     NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --var merges_this_session={{merges_this_session}} --json | jq -r '.new_epic_id // empty')
      if [ -z "$NEXT" ]; then
        echo "Could not pour next refinery wisp; not burning."
        gc runtime drain-ack
@@ -478,7 +521,8 @@ Target: $TARGET"
     gc runtime drain-ack
     exit 1
   fi
-  NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+  # Nothing merged, so the session bound carries unchanged.
+  NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --var merges_this_session={{merges_this_session}} --json | jq -r '.new_epic_id // empty')
   if [ -z "$NEXT" ]; then
     echo "Could not pour next refinery wisp; not burning."
     gc runtime drain-ack
@@ -517,7 +561,8 @@ pour_next_and_burn() {
     echo "Could not resolve current wisp; not burning."
     return 1
   fi
-  pnb_next=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+  # Callers are all early exits that merged nothing, so the bound carries unchanged.
+  pnb_next=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --var merges_this_session={{merges_this_session}} --json | jq -r '.new_epic_id // empty')
   if [ -z "$pnb_next" ]; then
     echo "Could not pour next refinery wisp; not burning."
     return 1
@@ -1278,13 +1323,33 @@ The convoy bead assignment is the ONLY path.
 
 If auto_land = "false": skip this entirely.
 
-**2. Resolve the current wisp, pour next iteration, then burn this wisp:**
+**2. Count this merge against the session bound:**
+
+This step is reached only when a work item finished — merged, published as a
+PR, or found already-merged. Early exits pour from their own step and never
+arrive here, so this is the one place the count moves, and it is a clean seam:
+the bead is closed and nothing is in flight.
+
+```bash
+MERGES_DONE=$(( {{merges_this_session}} + 1 ))
+MAX_MERGES={{max_merges_per_session}}
+if [ "$MAX_MERGES" -gt 0 ] && [ "$MERGES_DONE" -ge "$MAX_MERGES" ]; then
+  NEXT_MERGES=0          # successor is read by a fresh process
+  RESTART_AFTER_HANDOFF=yes
+else
+  NEXT_MERGES="$MERGES_DONE"
+  RESTART_AFTER_HANDOFF=no
+fi
+echo "Merges this session: $MERGES_DONE of $MAX_MERGES; restart after handoff: $RESTART_AFTER_HANDOFF"
+```
+
+**3. Resolve the current wisp, pour next iteration, then burn this wisp:**
 ```bash
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
   CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
 fi
-NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --json | jq -r '.new_epic_id // empty')
+NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{target_branch}} --var rig_name={{rig_name}} --var binding_prefix={{binding_prefix}} --var merges_this_session="$NEXT_MERGES" --json | jq -r '.new_epic_id // empty')
 if [ -z "$NEXT" ]; then
   echo "Could not pour next refinery wisp; not burning."
   gc runtime drain-ack
@@ -1304,4 +1369,26 @@ else
 fi
 ```
 
-Close this step. The new wisp is ready — re-read formula steps to begin."""
+**4. Restart if the bound was reached:**
+
+Only now — the successor is poured, assigned, and the old wisp is burned, so
+the new process wakes with work on its hook. Restarting any earlier strands
+the patrol (see **The session bound**).
+
+```bash
+if [ "$RESTART_AFTER_HANDOFF" = yes ]; then
+  gc runtime request-restart
+  RESTART_STATUS=$?
+  echo "Restart request returned with status $RESTART_STATUS; stop this session now."
+  exit "$RESTART_STATUS"
+fi
+```
+
+`gc runtime request-restart` blocks until the controller stops this session; on
+controller fault it can return nonzero after a bounded timeout. If it returns
+for any reason, stop immediately — do not close this step or process more merge
+work from this old session. The replacement session wakes on `$NEXT` and
+re-reads the formula steps with fresh context.
+
+If the bound was not reached, close this step. The new wisp is ready — re-read
+formula steps to begin."""
