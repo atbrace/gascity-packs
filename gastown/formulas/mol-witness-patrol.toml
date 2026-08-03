@@ -24,7 +24,9 @@ The witness is the rig's work-health monitor. It does NOT manage processes
 monitors the WORK layer:
 
 1. **Orphaned bead recovery** — beads assigned to agents that won't spawn
-   (pool max changed, agent removed from config). This is the core job.
+   (pool max changed, agent removed from config), beads dropped unassigned
+   mid-handoff, and workflow roots whose owning session is gone. This is
+   the core job.
 2. **Refinery queue health** — work beads assigned to refinery, staleness.
 3. **Polecat health** — detect stuck polecats, file warrants for dog pool.
 4. **Help mail** — triage HELP/escalation requests from polecats.
@@ -150,11 +152,10 @@ gc bd list --status=in_progress --json --limit=0
 gc bd list --status=open --json --limit=0
 ```
 
-Filter for beads with an assignee (skip unassigned beads). This pass does not
-solve the controller race where orphaned work may already have been released to
-open/unassigned before witness observes it; that requires a separate
-worktree-salvage scan keyed by `metadata.work_dir`. Bound Gastown polecat
-assignees use the shape `<rig>/{{binding_prefix}}<polecat-suffix>`.
+This pass covers beads that HAVE an assignee. Unassigned beads are not
+skipped — **Step 1b** picks them up via the worktree-salvage scan keyed by
+`metadata.work_dir`. Bound Gastown polecat assignees use the shape
+`<rig>/{{binding_prefix}}<polecat-suffix>`.
 
 Get the full session roster for liveness checks:
 ```bash
@@ -252,7 +253,88 @@ infrastructure agents (not pool instances) should be skipped — those
 agents have persistent identity and the controller manages their
 lifecycle directly.
 
+**Step 1b: Find UNASSIGNED orphans — the mid-handoff drop.**
+
+Step 1 cannot see the most damaging orphan, because that orphan has no
+assignee to resolve. A polecat that drains between "push branch" and
+"reassign to refinery" leaves the bead **unassigned, unrouted, and holding
+a pushed branch**. Observed live (sys-827u, 2026-07-24): branch on origin
+at 360b875, `metadata.branch` and `metadata.target` set, no assignee, no
+`gc.routed_to`. It sat orphaned for 4.5h with a healthy witness cycling
+past it every minute.
+
+`gc bd query` has no metadata predicate, so scan open beads and filter the
+JSON. Route through a temp file for the same ARG_MAX reason as Step 1:
+```bash
+OPEN_FILE=$(mktemp)
+gc bd list --status=open --json --limit=0 > "$OPEN_FILE"
+
+DROPPED=$(jq -r '
+  .[]
+  | select((.assignee // "") == "")
+  | select((.metadata["gc.routed_to"] // "") == "")
+  | select((.metadata.auto_push | tostring) != "false")
+  | select(((.metadata.work_dir // "") != "") or ((.metadata.branch // "") != ""))
+  | .id' "$OPEN_FILE")
+rm -f "$OPEN_FILE"
+```
+
+Three filters, each load-bearing:
+
+- **No assignee, no `gc.routed_to`** — nobody owns it and nothing is
+  routing it. An unassigned bead WITH `gc.routed_to` is pool work already
+  in flight; leave it for the pool.
+- **`auto_push` is not `false`** — a bead parked by `mol-pr-from-issue`
+  with `auto_push=false` is unassigned and branch-ready **on purpose**
+  (it also carries `branch_ready=true` and `halt_reason=auto_push_false`).
+  That is a deliberate halt awaiting a human, not a drop. Recovering it
+  would push work whose author explicitly opted out of the handoff.
+  Compare with `tostring`, never `//`: the value may be a JSON boolean,
+  and jq's `//` treats `false` as empty, so `(.metadata.auto_push // "")`
+  silently yields `""` and lets the halted bead through the filter.
+- **Has `work_dir` or `branch`** — the work artifact is what separates
+  "dropped mid-flight" from "never started". An unassigned bead with
+  neither is ordinary pool work waiting for dispatch; do not touch it.
+
+For each dropped bead, the branch decides the route:
+
+```bash
+DROPPED_UNPUBLISHED=""
+for BEAD in $DROPPED; do
+    META=$(gc bd show "$BEAD" --json | jq '.[0].metadata')
+    BRANCH=$(echo "$META" | jq -r '.branch // empty')
+    if [ -n "$BRANCH" ] && git ls-remote --heads origin "$BRANCH" | grep -q .; then
+        # Work is already canonical on the branch. Do NOT return it to the
+        # pool — that hands finished work to a fresh polecat to redo. The
+        # refinery verifies patch identity and closes the bead.
+        if [ -z "$(echo "$META" | jq -r '.target // empty')" ]; then
+            gc bd update "$BEAD" --set-metadata target=<rig-default-branch>
+        fi
+        gc sling <rig>/{{binding_prefix}}refinery "$BEAD" --no-formula --no-convoy --nudge
+    else
+        # Nothing published yet — the work exists only in the worktree.
+        # Hand it to Step 2 for salvage; Step 3b routes it afterwards.
+        DROPPED_UNPUBLISHED="$DROPPED_UNPUBLISHED $BEAD"
+    fi
+done
+```
+
+Routing to the refinery is exactly the recovery that was performed by hand
+for sys-827u: it sets `gc.routed_to`, and the refinery's orphan sweep then
+merges the already-pushed branch with no rework. `metadata.target` must be
+set for that merge to have a destination — the polecat normally sets it
+before pushing, so only backfill it when it is missing.
+
+Carry `$DROPPED_UNPUBLISHED` into Step 2 alongside the Step 1 orphans.
+Those beads reach Step 3b having just been pushed, so they take the
+refinery route there — **not** the pool reset, which would discard a
+finished branch and re-dispatch the work.
+
 **Step 2: For each orphaned bead, salvage work from the worktree.**
+
+Process the orphans from Step 1 **and** `$DROPPED_UNPUBLISHED` from
+Step 1b — both kinds have work sitting in a worktree that is not yet on a
+branch.
 
 The canonical work chain: `worktree → (push) → branch → (merge) → target`.
 Our job is to ensure work reaches the branch so it's schedulable.
@@ -260,9 +342,17 @@ Our job is to ensure work reaches the branch so it's schedulable.
 Read the bead metadata to find the worktree and branch:
 ```bash
 META=$(gc bd show <bead> --json | jq '.[0].metadata')
-WORKTREE=$(echo "$META" | jq -r '.worktree // empty')
+WORKTREE=$(echo "$META" | jq -r '.work_dir // empty')
 BRANCH=$(echo "$META" | jq -r '.branch // empty')
 ```
+
+The key is `work_dir` — the per-bead worktree the polecat records in its
+`workspace-setup` step, per the work-bead metadata contract. There is no
+`worktree` key on any bead; reading one silently yields empty and makes
+every salvage case below look like Case E ("nothing to salvage"), which
+discards the very work this step exists to rescue. Do not read
+`gc.work_dir` either: that is the agent's home directory, not the
+per-bead worktree, and cleaning it up would delete the agent's workspace.
 
 Check the bead and worktree state, then act:
 
@@ -359,6 +449,16 @@ Close any orphaned workflow subtree, then return the bead to pool:
 gc workflow delete-source <bead> --apply && gc workflow reopen-source <bead>
 ```
 
+**Exception — beads from `$DROPPED_UNPUBLISHED` (Step 1b).** Step 2 just
+pushed their branch, so the work is finished and canonical; the pool reset
+above would hand a completed branch to a fresh polecat to redo. Route
+them to the refinery instead, exactly as Step 1b does for the
+already-published case:
+```bash
+gc bd update <bead> --set-metadata branch="$BRANCH" --set-metadata target=<rig-default-branch>
+gc sling <rig>/{{binding_prefix}}refinery <bead> --no-formula --no-convoy --nudge
+```
+
 **Step 4: Assess and notify.**
 
 Always log each recovery as an event. Mail the mayor only when the
@@ -386,7 +486,89 @@ Mark recovered beads so spawn storm detection can track patterns:
 gc bd update <bead> --set-metadata recovered=true
 ```
 
-**Exit criteria:** All orphaned beads recovered, worktrees cleaned.
+**Step 5: Sweep abandoned workflow roots.**
+
+A molecule root (`issue_type=molecule`) whose owning session is gone is
+invisible to every other detector: `gc bd mol stale` does not flag it,
+`gc convoy stranded` does not flag it, and Steps 1/1b do not either,
+because the root carries no work artifacts of its own. Observed live:
+sys-57tt (a `mol-polecat-work` root) and sys-qcfh (a `mol-do-work` root)
+both sat `in_progress` with no owning session until an operator cleared
+them by hand.
+
+If the Step 1 fail-safe tripped (empty liveness map), skip this step too —
+it resolves owners against the same map and would sweep every live root.
+
+List the roots. Reuse `$LIVENESS_MAP` from Step 1; do not rebuild it, or
+the two scans can disagree about who is alive:
+```bash
+ROOTS_FILE=$(mktemp); LIVENESS_FILE=$(mktemp)
+gc bd list --type=molecule --status=open,in_progress --limit=0 --json > "$ROOTS_FILE"
+printf '%s' "$LIVENESS_MAP" > "$LIVENESS_FILE"
+```
+
+**Never sweep your own patrol.** The witness runs inside a
+`mol-witness-patrol` wisp, and `next-iteration` deliberately leaves its
+successor queued as `open`. Burning either one ends the patrol loop — the
+witness deletes itself and the rig silently loses its health monitor.
+Exclude your current wisp and everything assigned to you:
+```bash
+CURRENT_WISP=${GC_BEAD_ID:-}
+ABANDONED=$(jq -r --arg me "$GC_AGENT" --arg cur "$CURRENT_WISP" --slurpfile live "$LIVENESS_FILE" '
+  ($live[0] // {}) as $map
+  | .[]
+  | select(.id != $cur)
+  | select((.assignee // "") != $me)
+  | . as $root
+  | [(($root.assignee // "") | select(length > 0)),
+     (($root.metadata["gc.session_name"] // "") | select(length > 0))] as $owners
+  | select(($owners | length) > 0)
+  | select([$owners[] | ($map[.] // "absent")]
+           | all(. == "absent" or . == "closed" or . == "archived"))
+  | .id' "$ROOTS_FILE")
+rm -f "$ROOTS_FILE" "$LIVENESS_FILE"
+```
+
+A root carries up to two owner identities — `assignee` and
+`metadata["gc.session_name"]` — and a poured mol may be assigned to a
+configured identity while the session actually running it is recorded only
+in metadata. Collect both and sweep only when **every** identity present
+resolves dead. One live identity means the root still has an owner, even
+if the other is stale: it is the live session that is executing it.
+
+**A root with NO owner identity is not swept.** `next-iteration` pours the
+successor wisp and assigns it in two separate commands, so every patrol
+agent in the city leaves a briefly unassigned root behind on every cycle.
+Burning one of those kills that agent's loop just as surely as burning
+your own. There is no time floor available to disambiguate — `gc bd query`
+relative durations resolve `m` as months, not minutes, so a
+"younger than one patrol cycle" filter cannot be expressed. If an
+ownerless root is still sitting there cycle after cycle, mail the mayor
+with the id instead of burning it.
+
+Apply the same classification as Step 1. `active`, `awake`, `creating`,
+`asleep`, `drained`, `suspended`, `draining`, and `quarantined` all mean
+the root still has an owner — leave it alone. Only `absent`, `closed`, or
+`archived` is abandoned.
+
+Dispose by phase. Both commands take the ROOT id, never a member id, and
+both are destructive:
+```bash
+for ROOT in $ABANDONED; do
+    if [ "$(gc bd show "$ROOT" --json | jq -r '.[0].ephemeral // false')" = "true" ]; then
+        gc bd mol burn "$ROOT" --force       # wisp: direct delete
+    else
+        gc convoy delete "$ROOT" --force     # mol: closes the whole subtree
+    fi
+done
+```
+
+Log every sweep. Mail the mayor only when roots accumulate cycle over
+cycle — one abandoned root after a crash is routine, a growing count means
+sessions are dying without draining and the leak is upstream of you.
+
+**Exit criteria:** All orphaned beads recovered, worktrees cleaned,
+abandoned workflow roots swept.
 Or no orphans found. Continue to `check-refinery` — do NOT exit the
 wisp here. The `next-iteration` step is the only place that pours the
 next wisp and burns this one."""
