@@ -216,6 +216,83 @@ if verify >= metadata:
 PY
 }
 
+test_next_iteration_excludes_current_wisp_from_successor_queries() {
+    local witness_prompt deacon_prompt witness_formula
+    witness_prompt="$GASTOWN/agents/witness/prompt.template.md"
+    deacon_prompt="$GASTOWN/agents/deacon/prompt.template.md"
+    witness_formula="$GASTOWN/formulas/mol-witness-patrol.toml"
+
+    # A patrol agent's current wisp is still status=open until it transitions,
+    # so an unfiltered --status=open successor query returns the current wisp
+    # itself. The reconciler then reads "a successor is already queued", burns
+    # the current wisp without pouring one, and leaves the agent with zero
+    # wisps until a human notices.
+    grep -F 'jq -r --arg cur "$CURRENT_WISP"' "$witness_prompt" >/dev/null ||
+        fail "witness fallback must pass CURRENT_WISP to the successor query"
+    grep -F 'select(.id != $cur)' "$witness_prompt" >/dev/null ||
+        fail "witness fallback must exclude CURRENT_WISP from OPEN_WISPS"
+    grep -F 'jq -r --arg cur "$CURRENT_WISP"' "$deacon_prompt" >/dev/null ||
+        fail "deacon fallback must pass CURRENT_WISP to the successor query"
+    grep -F 'select(.id != $cur)' "$deacon_prompt" >/dev/null ||
+        fail "deacon fallback must exclude CURRENT_WISP from ASSIGNED_WISP"
+
+    # mol-witness-patrol's next-iteration step had no CURRENT_WISP guard at
+    # all: it picked NEXT off the raw open-wisp list, then burned "this wisp"
+    # by hand-substituted placeholder — which could be the same bead.
+    grep -F 'CURRENT_WISP=${GC_BEAD_ID:-}' "$witness_formula" >/dev/null ||
+        fail "mol-witness-patrol next-iteration must resolve the current wisp"
+    grep -F 'jq -r --arg cur "$CURRENT_WISP"' "$witness_formula" >/dev/null ||
+        fail "mol-witness-patrol next-iteration must pass CURRENT_WISP to the successor query"
+    grep -F 'select(.id != $cur)' "$witness_formula" >/dev/null ||
+        fail "mol-witness-patrol next-iteration must exclude CURRENT_WISP from OPEN_WISPS"
+    grep -F 'gc bd mol burn "$CURRENT_WISP" --force' "$witness_formula" >/dev/null ||
+        fail "mol-witness-patrol must burn the resolved current wisp"
+    ! grep -F 'gc bd mol burn <this-wisp-id>' "$witness_formula" >/dev/null ||
+        fail "mol-witness-patrol must not burn a hand-substituted wisp placeholder"
+
+    # Guard every sibling site: once a shell block resolves CURRENT_WISP, any
+    # open-molecule query in that block is deriving a successor and must filter
+    # the current wisp out. The startup reconcilers, which union open and
+    # in_progress to pick one wisp to resume, never set CURRENT_WISP and are
+    # correctly exempt.
+    python3 - "$GASTOWN" <<'PY' || fail "successor wisp query does not exclude CURRENT_WISP"
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(sys.argv[1])
+open_fence = re.compile(r"^\s*```bash\s*$")
+close_fence = re.compile(r"^\s*```\s*$")
+QUERY = "--status=open --type=molecule"
+EXCLUSION = "select(.id != $cur)"
+
+violations = []
+for path in sorted(root.rglob("*")):
+    if path.suffix not in {".md", ".toml"} or not path.is_file():
+        continue
+    block = None
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if block is None:
+            if open_fence.match(line):
+                block = []
+            continue
+        if close_fence.match(line):
+            if any("CURRENT_WISP=" in entry for entry, _ in block):
+                violations += [
+                    f"{path.relative_to(root)}:{where}: {entry.strip()}"
+                    for entry, where in block
+                    if QUERY in entry and EXCLUSION not in entry
+                ]
+            block = None
+            continue
+        block.append((line, number))
+
+if violations:
+    print("\n".join(violations))
+    raise SystemExit(1)
+PY
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_shutdown_dance_contracts_are_executable
@@ -224,5 +301,6 @@ test_composition_is_documented
 test_polecat_startup_uses_standard_hook_claim
 test_review_leg_contract_forbids_synthetic_mutation
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
+test_next_iteration_excludes_current_wisp_from_successor_queries
 
 echo "gastown pack asset tests passed"

@@ -205,12 +205,17 @@ CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
   CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
 fi
-# Reconcile queued (open) patrol wisps to exactly one. A prior cycle may have
-# poured a next wisp without burning, or a restart may have raced — keep the
-# first and burn the surplus so wisps never accumulate. Wisp roots are
+# Reconcile queued (open) SUCCESSOR wisps to exactly one. A prior cycle may
+# have poured a next wisp without burning, or a restart may have raced — keep
+# the first and burn the surplus so wisps never accumulate. Wisp roots are
 # molecules (never --type=wisp, which is not a valid gc bd type and matches
 # nothing).
-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r '.[].id')
+#
+# CURRENT_WISP must be excluded explicitly: it is still status=open until it
+# transitions, so an unfiltered query returns it as its own successor. That
+# makes ASSIGNED_WISP non-empty, sends us down the burn-without-pour branch,
+# and leaves this agent with zero wisps.
+OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r --arg cur "$CURRENT_WISP" '.[] | select(.id != $cur) | .id')
 ASSIGNED_WISP=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
 for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
   gc bd mol burn "$extra" --force

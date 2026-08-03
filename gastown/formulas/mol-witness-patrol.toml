@@ -530,21 +530,45 @@ may have poured a next wisp without burning, or a restart may have raced —
 keep one open patrol wisp and burn any surplus, so wisps never accumulate.
 Wisp roots are `issue_type=molecule` (never `--type=wisp`, which is not a
 valid gc bd type and matches nothing).
+
+Resolve the current wisp FIRST and exclude it from the successor list. It is
+still status=open until it transitions, so an unfiltered query returns it as
+its own successor: `NEXT` would point at the very wisp step 3 burns, and the
+surplus loop would burn a legitimately-queued successor that sorted after it.
+Either way this agent ends the cycle with zero wisps.
 ```bash
-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r '.[].id')
+CURRENT_WISP=${GC_BEAD_ID:-}
+if [ -z "$CURRENT_WISP" ]; then
+  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
+fi
+OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r --arg cur "$CURRENT_WISP" '.[] | select(.id != $cur) | .id')
 NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
 for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
   gc bd mol burn "$extra" --force
 done
 if [ -z "$NEXT" ]; then
-  NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id')
-  gc bd update "$NEXT" --assignee="$GC_AGENT"
+  NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
+  if [ -z "$NEXT" ]; then
+    echo "Could not pour next witness wisp; not burning."
+    exit 1
+  fi
+  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+    echo "Could not assign next witness wisp; not burning."
+    exit 1
+  fi
 fi
 ```
 
 **3. Burn this wisp:**
+
+Burn the wisp resolved in step 2, not a hand-substituted id — `$NEXT` is now
+guaranteed to be a different bead, so this cannot burn the successor.
 ```bash
-gc bd mol burn <this-wisp-id> --force
+if [ -n "$CURRENT_WISP" ]; then
+  gc bd mol burn "$CURRENT_WISP" --force
+else
+  echo "Could not resolve current witness wisp; not burning."
+fi
 ```
 
 **4. Exit this turn:**
