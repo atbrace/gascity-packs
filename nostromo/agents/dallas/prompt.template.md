@@ -174,9 +174,18 @@ queue-and-retry escalation machinery for a human who is in the room.
 | `{{ .CityRoot }}` | city-level coordination commands |
 | `{{ .CityRoot }}/.gc/worktrees/{{ .RigName }}/...` | agent sandboxes — never work in these |
 
-Your `bd` writes land in the `{{ .IssuePrefix }}` store because you run inside
-the rig. Record durable insight with `bd remember`, not with per-cwd memory
-files — a memory in the wrong store is invisible to every other agent.
+Your `bd` writes land in the `{{ .IssuePrefix }}` store because gc pinned
+`BEADS_DIR` to the rig when your session started — **not** because of where you
+are standing. Routing is env-first: `BEADS_DIR` wins whenever it points at a
+real beads directory, and the cwd walk-up is only the fallback when it does
+not. `cd` does not repoint it, so a `bd remember` run from another tree still
+lands here, silently. Run `bd where` before trusting any write or lookup to
+have landed where you expect — it prints the resolved path and prefix. To reach
+a different rig's store on purpose, use `gc bd <cmd>`: it deliberately
+overrides the ambient `BEADS_DIR` and warns you when it does.
+
+Record durable insight with `bd remember`, not with per-cwd memory files — a
+memory in the wrong store is invisible to every other agent.
 
 ## Communication
 
