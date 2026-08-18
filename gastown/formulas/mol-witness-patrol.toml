@@ -260,7 +260,7 @@ Our job is to ensure work reaches the branch so it's schedulable.
 Read the bead metadata to find the worktree and branch:
 ```bash
 META=$(gc bd show <bead> --json | jq '.[0].metadata')
-WORKTREE=$(echo "$META" | jq -r '.worktree // empty')
+WORKTREE=$(echo "$META" | jq -r '.work_dir // empty')
 BRANCH=$(echo "$META" | jq -r '.branch // empty')
 ```
 
@@ -282,6 +282,39 @@ git ls-remote --heads origin $BRANCH
 If branch IS on origin → skip to Step 3.
 If branch is NOT on origin → fall through to Case C.
 
+**Salvage commit rules — apply to Case C and Case D.**
+
+Cases C and D commit a dead agent's leftover work. Two rules are mandatory.
+Both come from a real salvage (2026-08-01, beads gcy-fjd and gcy-zes) that
+only succeeded because the witness deviated from this recipe.
+
+1. **Never `git add -A` in an agent worktree.** The harness materializes
+   `.claude/` into every worktree, and its skill entries are ABSOLUTE symlinks
+   into `~/.gc/cache/repos/<hash>/…`. Those paths are ignored in the canonical
+   checkout, but in the worktree they appear as ordinary untracked files, so
+   `git add -A` commits machine-local broken links onto the branch for every
+   other machine to trip over. Stage the work paths explicitly instead:
+   ```bash
+   git status --short --untracked-files=all   # everything, harness scaffolding included
+   git add -- <work paths>                    # ONLY the project's own paths, e.g. cmd/ internal/
+   git diff --cached --name-only              # verify: no .claude/, .gc/ or worktrees/ entries
+   ```
+
+2. **Commit with `--no-verify`.** This is intended behavior, not a workaround.
+   A salvage commit is work-in-progress by definition and cannot be expected to
+   pass lint — preserving the work is the entire point. The hook is also a real
+   abort risk: `lint-changed: ./cmd/gc` has exceeded two minutes and killed a
+   salvage attempt outright. A recipe whose first action can be killed by a lint
+   hook will eventually strand a witness and destroy the work when the next
+   polecat replaces the worktree. Record the reason in the commit message so it
+   reads as deliberate:
+   ```bash
+   git commit --no-verify -m "witness: salvage work from orphaned agent (<bead>)
+
+   --no-verify: WIP salvage from a dead session. Lint is not expected to pass,
+   and the pre-commit hook can outrun the salvage window."
+   ```
+
 **Case C: Worktree exists with unpushed commits.**
 Work is committed locally but never pushed. Branch is not yet canonical.
 ```bash
@@ -289,12 +322,14 @@ cd "$WORKTREE"
 BRANCH=$(git branch --show-current)
 git log origin/main..HEAD --oneline  # Shows unpushed commits
 ```
-Commit any remaining uncommitted/untracked work first (safeguard):
+Commit any remaining uncommitted/untracked work first (safeguard), under
+the salvage commit rules above:
 ```bash
-git status --porcelain
-# If any output:
-git add -A
-git commit -m "witness: salvage uncommitted work (<bead>)"
+git status --short --untracked-files=all
+# If any work paths are dirty or untracked — stage them by name, never `git add -A`:
+git add -- <work paths>
+git diff --cached --name-only   # verify: no .claude/, .gc/ or worktrees/ entries
+git commit --no-verify -m "witness: salvage uncommitted work (<bead>)"
 ```
 Publish the work to make branch canonical:
 ```bash
@@ -305,10 +340,14 @@ Skip to Step 3 (cleanup).
 
 **Case D: Worktree exists with ONLY uncommitted/untracked changes (no commits).**
 Same resolution as Case C. All work is useful work — never discard.
+Apply the salvage commit rules above — stage the work paths by name and
+commit with `--no-verify`:
 ```bash
 cd "$WORKTREE"
-git add -A
-git commit -m "witness: salvage work from orphaned agent (<bead>)"
+git status --short --untracked-files=all
+git add -- <work paths>
+git diff --cached --name-only   # verify: no .claude/, .gc/ or worktrees/ entries
+git commit --no-verify -m "witness: salvage work from orphaned agent (<bead>)"
 BRANCH=$(git branch --show-current)
 git push origin HEAD
 gc bd update <bead> --set-metadata branch=$BRANCH

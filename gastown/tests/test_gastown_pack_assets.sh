@@ -293,6 +293,44 @@ if violations:
 PY
 }
 
+test_orphan_salvage_stages_work_paths_and_bypasses_lint_hook() {
+    # A real salvage (2026-08-01, beads gcy-fjd and gcy-zes) only succeeded
+    # because the witness deviated from this recipe twice. `git add -A` in an
+    # agent worktree stages the harness's .claude/ scaffolding — absolute
+    # symlinks into ~/.gc/cache/repos/<hash>/ — onto the branch, and the
+    # pre-commit lint hook ran past two minutes and killed the first attempt
+    # outright. This step is the last line of defense against losing a dead
+    # agent's uncommitted work, so both deviations are now the recipe.
+    python3 - "$GASTOWN/formulas/mol-witness-patrol.toml" <<'PY' || fail "recover-orphaned-beads salvage contract violated"
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    steps = tomllib.load(handle)["steps"]
+
+description = next(s for s in steps if s["id"] == "recover-orphaned-beads")["description"]
+lines = description.splitlines()
+problems = []
+
+if any(line.strip().startswith("git add -A") for line in lines):
+    problems.append("salvage must stage work paths by name, never `git add -A`")
+
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("git commit") and "--no-verify" not in stripped:
+        problems.append("salvage commit must pass --no-verify: %s" % stripped)
+
+# work_dir is the key the polecat writes at branch-setup; metadata.worktree is
+# never set, so reading it leaves WORKTREE empty and the salvage cd's nowhere.
+if ".worktree // empty" in description or ".work_dir // empty" not in description:
+    problems.append("salvage must read the worktree path from metadata.work_dir")
+
+if problems:
+    print("\n".join(problems))
+    raise SystemExit(1)
+PY
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_shutdown_dance_contracts_are_executable
@@ -302,5 +340,6 @@ test_polecat_startup_uses_standard_hook_claim
 test_review_leg_contract_forbids_synthetic_mutation
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
 test_next_iteration_excludes_current_wisp_from_successor_queries
+test_orphan_salvage_stages_work_paths_and_bypasses_lint_hook
 
 echo "gastown pack asset tests passed"
