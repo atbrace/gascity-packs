@@ -248,6 +248,48 @@ make registry-format-validate
 GC=/path/to/gc make registry-validate
 ```
 
+### Release drift: why a merged pack fix may not be live
+
+`validate_registry.py` proves a release is *internally* consistent — the
+recorded hash matches the pack content at the recorded commit. It cannot see a
+release that is merely **old**. A pin that is stale but self-consistent passes
+validation silently, so a merged pack change keeps sitting in git while every
+consumer keeps materializing the previously released bytes. Merging is not
+publishing.
+
+`scripts/pack_drift_check.py` closes that gap:
+
+```sh
+# Which packs have moved past their published release?
+make registry-drift
+
+# CI gate: fail only for packs this change touches
+make registry-drift CHANGED_SINCE=origin/main
+
+# Also audit a city's import pins and formula overrides
+make registry-drift CITY=/path/to/city
+```
+
+CI runs the `CHANGED_SINCE` form on every PR, so changing a pack without
+re-stamping its release fails the build. Pre-existing drift in packs the PR
+does not touch is reported as a warning.
+
+With `CITY=`, it additionally reports three ways a city keeps running old bytes
+even after a release is published:
+
+- **`city-import-stale`** — the city's `[imports.<pack>] version = "sha:..."`
+  pin lags the newest published release commit.
+- **`city-import-foreign-origin`** — the city resolves the pack from a
+  different repository than the one this repo pushes to. No pin value can
+  express this and no re-stamp can fix it: merges land in one repo while the
+  city materializes from another, and both sides look internally current.
+- **`city-fork-stale` / `city-fork-unanchored`** — the city shadows a pack
+  formula with a local copy under `<city>/formulas/`. The sibling
+  `.<name>.forkbase` file records the upstream file hash the fork was taken
+  from; when upstream moves past that anchor the override silently swallows
+  the newer version. A fork with no anchor cannot be reconciled mechanically
+  at all.
+
 ### Publishing a pack to the registry
 
 `registry.toml` is the public catalog. Each `[[pack.release]]` carries a

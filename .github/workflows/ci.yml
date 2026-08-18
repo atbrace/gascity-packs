@@ -37,6 +37,18 @@ jobs:
       - name: Validate registry
         run: python3 validate_registry.py
 
+      # validate_registry.py only proves a release is self-consistent (recorded
+      # hash matches content at the recorded commit); a stale-but-consistent pin
+      # passes it silently. This gate fails a PR that changes a pack without
+      # re-stamping its release, so merged pack fixes cannot sit unpublished
+      # while consumers keep materializing the old bytes. Pre-existing drift in
+      # packs the PR does not touch is reported as a warning, not a failure.
+      - name: Check pack release drift
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: python3 scripts/pack_drift_check.py --changed-since "origin/$BASE_REF"
+
       - name: Run Python pack tests
         run: python3 -m pytest tests contributing/tests gascity/tests discord/tests github/tests slack-full/tests slack-channel/tests pr-pipeline/tests -q
 

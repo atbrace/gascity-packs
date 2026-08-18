@@ -14,13 +14,14 @@ ifneq ($(strip $(PACK_DESCRIPTION)),)
 STAMP_PACK_DESCRIPTION := --pack-description "$(PACK_DESCRIPTION)"
 endif
 
-.PHONY: registry-help registry-format-validate registry-validate registry-validate-all registry-publish registry-withdraw
+.PHONY: registry-help registry-format-validate registry-validate registry-validate-all registry-drift registry-publish registry-withdraw
 
 registry-help:
 	@printf '%s\n' 'Registry targets:'
 	@printf '%s\n' '  make registry-format-validate'
 	@printf '%s\n' '  make registry-validate GC=/path/to/gc'
 	@printf '%s\n' '  make registry-validate-all GC=/path/to/gc'
+	@printf '%s\n' '  make registry-drift [CITY=/path/to/city] [CHANGED_SINCE=origin/main]'
 	@printf '%s\n' '  make registry-publish GC=/path/to/gc PACK=<name> VERSION=<semver> DESCRIPTION="..." [PACK_PATH=<path>] [PACK_DESCRIPTION="..."]'
 	@printf '%s\n' '  make registry-withdraw PACK=<name> VERSION=<semver> REASON="..."'
 
@@ -32,6 +33,15 @@ registry-validate:
 
 registry-validate-all:
 	$(GC) pack release validate $(REGISTRY) --include-withdrawn
+
+# Report packs whose content has moved past their published release, plus (with
+# CITY=) a city whose import pins or formula overrides shadow newer pack bytes.
+# CHANGED_SINCE= restricts fatal findings to packs touched since that ref.
+registry-drift:
+	$(PYTHON) scripts/pack_drift_check.py \
+		--registry $(REGISTRY) \
+		$(if $(strip $(CHANGED_SINCE)),--changed-since $(CHANGED_SINCE),) \
+		$(if $(strip $(CITY)),--city $(CITY),)
 
 registry-publish:
 	@test -n "$(PACK)" || { echo "PACK is required"; exit 2; }
