@@ -1,3 +1,35 @@
+{{ define "durable-retractions" }}
+### Retractions Are Results, Not Cleanup
+
+When you contradict or withdraw something you already wrote to a bead — a
+root cause, a diagnosis, a "this is why it failed" — recording that reversal
+is a deliverable. It counts on your ledger exactly like the finding it kills.
+
+The asymmetry that makes this a rule: reporting is the convention, so the
+confident claim is already durable. The correction feels like housekeeping,
+so it stays in your context — and your context does not survive the session.
+A wrong finding reliably outlives the retraction that killed it, and the bead
+still reads as CURRENT because nothing on it signals the author later
+disagreed.
+
+Write the retraction into the field the claim lives in, before the step that
+discovered the contradiction closes:
+
+| Claim lives in | Retract with |
+|---|---|
+| Title | `gc bd update <id> --title "RETRACTED: <corrected framing>"` |
+| Description | `gc bd update <id> -d "<amended text, opening with RETRACTED: and what replaced it>"` |
+| Notes | `gc bd note <id> "RETRACTED: <the claim> — <the evidence that killed it>"` |
+
+Add a comment for the evidence trail, but a comment alone does not retract a
+description. Comments are additive: the stale claim keeps its position, still
+reads as current, and still dominates the next reader's first impression.
+
+Measured cost of skipping it: a withdrawn ICU/CGO root cause that lived only
+in one session's transcript sent two rigs ~9 hours into work built on a
+diagnosis its own author had already abandoned.
+{{ end }}
+
 {{ define "capability-ledger-work" }}
 ## The Capability Ledger
 
@@ -24,6 +56,8 @@ becomes part of a permanent ledger of demonstrated capability.
 
 This isn't just about the current task. It's about building a track record that
 demonstrates capability over time. Execute with care.
+
+{{ template "durable-retractions" . }}
 {{ end }}
 
 {{ define "capability-ledger-patrol" }}
@@ -50,6 +84,8 @@ detect and resolve becomes part of a permanent ledger of demonstrated capability
 
 This isn't just about the current patrol. It's about building a track record
 of reliable oversight. Execute with care.
+
+{{ template "durable-retractions" . }}
 {{ end }}
 
 {{ define "capability-ledger-merge" }}
@@ -74,4 +110,6 @@ becomes part of a permanent ledger of demonstrated capability.
 
 This isn't just about the current merge. It's about building a track record
 of reliable merge processing. Execute with care.
+
+{{ template "durable-retractions" . }}
 {{ end }}

@@ -1240,6 +1240,10 @@ Include:
 - Bugs filed (IDs, if any pre-existing failures were tracked)
 - Rejections (if the branch was rejected back to pool)
 - Any escalations sent
+- Findings withdrawn (any diagnosis you recorded on a bead this cycle and
+  later disproved). Retract it on that bead — in the field the claim lives in
+  — before writing this summary. A root cause you disproved in-session but
+  recorded nowhere leaves that bead reading as current.
 
 If the cycle ended early (conflict rejection, no work found), note
 why and what state was left.

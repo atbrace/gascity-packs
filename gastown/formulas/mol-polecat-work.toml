@@ -424,6 +424,13 @@ provided by the caller, `metadata.existing_pr` is preserved for refinery
 validation. The refinery records canonical `pr_url` only after verifying
 the PR is open and matches the branch, base, and origin repository.
 
+If anything you wrote to this bead earlier turned out to be wrong — your own
+diagnosis, or a `rejection_reason` you inherited and disproved — retract it
+here, in the field the claim lives in. `--notes` appends; it does not amend a
+description that still asserts the dead claim. You cease to exist after this
+step, so an unrecorded correction dies with you while the claim it killed
+stays on the bead reading as current.
+
 **6. Reassign to refinery:**
 ```bash
 REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"

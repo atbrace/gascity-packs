@@ -553,6 +553,14 @@ description = """
 
 End of patrol cycle. Pour the next iteration, then wait or exit.
 
+Before the numbered steps: if this cycle contradicted or withdrew a finding
+you recorded on a bead, write the retraction to that bead now — into the
+field the claim lives in, carrying a `RETRACTED:` marker, via
+`gc bd update --title` / `-d` or `gc bd note`. The wisp burn below and
+`gc runtime request-restart` both end this context. An unrecorded correction
+dies with it, while the claim it killed stays on the bead reading as
+current.
+
 **1. Context check:**
 
 If context feels heavy or RSS is high:

@@ -331,6 +331,83 @@ if problems:
 PY
 }
 
+test_retractions_are_durable_deliverables() {
+    local ledger
+    ledger="$GASTOWN/template-fragments/capability-ledger.template.md"
+
+    grep -F '{{ define "durable-retractions" }}' "$ledger" >/dev/null ||
+        fail "capability ledger must define the shared durable-retractions block"
+    grep -F 'RETRACTED:' "$ledger" >/dev/null ||
+        fail "retraction convention must specify the standard RETRACTED marker"
+
+    # Prose assertions normalize whitespace so rewrapping a paragraph does not
+    # break a contract test that is about content, not line breaks.
+    python3 - "$GASTOWN" <<'RETRACTION_PY'
+import pathlib
+import re
+import sys
+
+gastown = pathlib.Path(sys.argv[1])
+failures = []
+
+
+def flat(path):
+    return re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
+
+
+ledger_path = gastown / "template-fragments" / "capability-ledger.template.md"
+ledger = flat(ledger_path)
+for phrase in (
+    "the field the claim lives in",
+    "a comment alone does not retract a description",
+):
+    if phrase not in ledger:
+        failures.append(f"capability-ledger.template.md must say: {phrase}")
+
+blocks = {}
+current = None
+for line in ledger_path.read_text(encoding="utf-8").splitlines():
+    match = re.match(r'\{\{ define "([^"]+)" \}\}', line.strip())
+    if match:
+        current = match.group(1)
+        blocks[current] = []
+        continue
+    if current is not None:
+        blocks[current].append(line)
+
+CALL = '{{ template "durable-retractions" . }}'
+for name in (
+    "capability-ledger-work",
+    "capability-ledger-patrol",
+    "capability-ledger-merge",
+):
+    if CALL not in "\n".join(blocks.get(name, [])):
+        failures.append(f"{name} must include the durable-retractions block")
+
+for name in (
+    "mol-polecat-work",
+    "mol-refinery-patrol",
+    "mol-witness-patrol",
+    "mol-deacon-patrol",
+):
+    formula = flat(gastown / "formulas" / f"{name}.toml")
+    if "the field the claim lives in" not in formula:
+        failures.append(
+            f"{name}.toml must require a withdrawn finding be retracted where the claim lives"
+        )
+
+refinery = flat(gastown / "formulas" / "mol-refinery-patrol.toml")
+if "- Findings withdrawn" not in refinery:
+    failures.append(
+        "mol-refinery-patrol patrol-summary must enumerate withdrawn findings"
+    )
+
+if failures:
+    print("\n".join(failures))
+    raise SystemExit(1)
+RETRACTION_PY
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_shutdown_dance_contracts_are_executable
@@ -341,5 +418,6 @@ test_review_leg_contract_forbids_synthetic_mutation
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
 test_next_iteration_excludes_current_wisp_from_successor_queries
 test_orphan_salvage_stages_work_paths_and_bypasses_lint_hook
+test_retractions_are_durable_deliverables
 
 echo "gastown pack asset tests passed"
