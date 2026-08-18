@@ -10,6 +10,14 @@ import tomllib
 import unittest
 
 
+# Hang guard for the claim command's subprocess runs, not a latency budget.
+# The command shells out to python3 once per JSON field it reads, so a case
+# that exhausts both retry loops spawns roughly twenty interpreters: measured
+# at 3.7s and 5.0s on macOS against the 2s this used to allow. Keep it far
+# above the real cost and far below "hangs forever".
+CLAIM_HANG_GUARD_SECONDS = 60
+
+
 FORMULAS = {
     "build-base",
     "build-basic",
@@ -859,7 +867,7 @@ class FormulaAssetTests(unittest.TestCase):
                 "PATH": f"{bin_dir}:/usr/bin:/bin",
             }
             result = subprocess.run(
-                [str(command)], capture_output=True, env=env, text=True, timeout=2
+                [str(command)], capture_output=True, env=env, text=True, timeout=CLAIM_HANG_GUARD_SECONDS
             )
             call_lines = calls.read_text(encoding="utf-8").splitlines()
 
@@ -1002,7 +1010,7 @@ class FormulaAssetTests(unittest.TestCase):
                 "PATH": f"{bin_dir}:/usr/bin:/bin",
             }
             result = subprocess.run(
-                [str(command)], capture_output=True, env=env, text=True, timeout=2
+                [str(command)], capture_output=True, env=env, text=True, timeout=CLAIM_HANG_GUARD_SECONDS
             )
             call_lines = calls.read_text(encoding="utf-8").splitlines()
 
@@ -1108,7 +1116,7 @@ class FormulaAssetTests(unittest.TestCase):
                 "PATH": f"{bin_dir}:/usr/bin:/bin",
             }
             result = subprocess.run(
-                [str(command)], capture_output=True, env=env, text=True, timeout=2
+                [str(command)], capture_output=True, env=env, text=True, timeout=CLAIM_HANG_GUARD_SECONDS
             )
             call_lines = calls.read_text(encoding="utf-8").splitlines()
 
