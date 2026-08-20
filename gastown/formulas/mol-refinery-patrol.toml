@@ -222,7 +222,31 @@ gc bd show $WORK --json | jq '.[0].metadata'
 The bead MUST have `metadata.branch`. If `metadata.target` is missing,
 use {{target_branch}} as default. Note the work bead ID and close this step.
 
-If NO work found:
+If NO work found, confirm the queue is genuinely empty before saying so.
+The selector above requires `--status=open` — that is the refinery's queue
+contract, written by the rejection paths in this formula, which return a
+conflicted or failed branch to the pool as `--status=open --assignee=""`.
+A branch-ready bead assigned here in any OTHER status is invisible to the
+scan and will never merge, and that is indistinguishable from a genuinely
+idle refinery on every surface we have (sys-oxu96):
+
+```bash
+STUCK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT \\
+  --exclude-type=epic --has-metadata-key=branch --limit=20 --json \\
+  | jq -r '[.[] | select(.status != "open")] | .[] | "\\(.id) [\\(.status)]"')
+```
+
+If `$STUCK` is non-empty, say so instead of idling silently:
+```bash
+gc session nudge mayor "REFINERY SCAN MISMATCH: branch-ready beads assigned to me are not status=open, so the queue scan can never see them and they will never merge: $STUCK"
+echo "STUCK (excluded by queue scan, needs status=open): $STUCK"
+```
+
+Do NOT flip them to open yourself. `in_progress` means a session is actively
+working that bead; deciding it is ready to merge belongs to the submitter, not
+to the refinery. Report, then take the idle exit below as normal.
+
+Then, stuck beads or not:
 Write exactly:
 ```
 IDLE: no work, exiting turn.
