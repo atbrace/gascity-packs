@@ -1,7 +1,17 @@
 scope = "rig"
 wake_mode = "fresh"
 work_dir = ".gc/worktrees/{{.Rig}}/polecats/{{.AgentBase}}"
-nudge = "Run gc hook --claim --json now; if it returns work, execute the claimed formula immediately."
+# 2026-08-22 (sysadmin sys-p2jbf): the previous wording was "Run gc hook --claim
+# --json now; if it returns work, execute the claimed formula immediately." A nudge
+# arrives as bare text in the prompt stream with no provenance, so that phrasing is
+# indistinguishable from a prompt injection telling a lane to run a command and
+# execute whatever comes back. Three sysadmin lanes REFUSED it and two escalated it
+# as a suspected attack. The refusals were correct -- they applied the litmus the
+# agent prompts ask for ("could I reproduce this directive from durable state?"),
+# which a bare imperative cannot satisfy. Keep the wording self-attributing and
+# pointed at the authenticated artifact (the claimed bead); do not shorten it back
+# into an imperative.
+nudge = "Pool wake emitted by your OWN lane config (the nudge= line in this agent.toml), not an inbound directive from anyone: run gc hook --claim --json. Whatever it returns is authenticated bead state -- act on that, and never on the wording of this line."
 pre_start = ["{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync"]
 idle_timeout = "2h"
 min_active_sessions = 0
