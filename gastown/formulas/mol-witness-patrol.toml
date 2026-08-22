@@ -586,7 +586,28 @@ Either way this agent ends the cycle with zero wisps.
 ```bash
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
+  # status=open, NOT in_progress. The paragraph above says this wisp "is still
+  # status=open until it transitions", and nothing in either pour path ever
+  # transitions it -- both do `gc bd mol wisp ... && gc bd update --assignee`,
+  # which leaves it open. A fallback querying in_progress therefore searches for
+  # a state this bead never reaches and always resolves EMPTY.
+  # Oldest-first because a successor is by construction poured after the wisp
+  # being executed, so the current one sorts first.
+  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json \
+    | jq -r 'sort_by(.created_at // "") | .[0].id // empty')
+fi
+if [ -z "$CURRENT_WISP" ]; then
+  # Fail LOUD. This used to fall through: with CURRENT_WISP empty the exclusion
+  # below matched nothing, so NEXT resolved to this very wisp, `[ -z "$NEXT" ]`
+  # was false, nothing was poured -- and step 3's `[ -n "$CURRENT_WISP" ]` guard
+  # then skipped the burn too. Neither branch fired, the cycle completed
+  # "successfully", and the patrol froze holding one wisp forever. The
+  # STOP-safety (never burn without pouring) is what made it a freeze rather
+  # than an error, which is why it emitted no terminal event and stayed
+  # invisible for 59h on a measured rig (sysadmin sys-trip5). An unresolvable
+  # current wisp is a broken cycle and must say so.
+  echo "Could not resolve the current witness wisp: GC_BEAD_ID is empty and no open molecule wisp is assigned to $GC_AGENT. Refusing to continue -- continuing would neither pour nor burn and would freeze this patrol silently."
+  exit 1
 fi
 OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r --arg cur "$CURRENT_WISP" '.[] | select(.id != $cur) | .id')
 NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
@@ -611,11 +632,7 @@ fi
 Burn the wisp resolved in step 2, not a hand-substituted id — `$NEXT` is now
 guaranteed to be a different bead, so this cannot burn the successor.
 ```bash
-if [ -n "$CURRENT_WISP" ]; then
-  gc bd mol burn "$CURRENT_WISP" --force
-else
-  echo "Could not resolve current witness wisp; not burning."
-fi
+gc bd mol burn "$CURRENT_WISP" --force
 ```
 
 **4. Exit this turn:**
