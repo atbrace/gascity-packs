@@ -1259,13 +1259,24 @@ If this command fails or prints empty output: STOP. Debug and retry. Do NOT cont
 
 **4. Record PR metadata and close the work bead:**
 
-Run as a single chained command so the metadata write cannot be skipped
-when the close-reason already names the PR. Both the `--set-metadata`
-write and the `gc bd close` are required — `pr_url` and `pr_number`
-are the only forensic breadcrumbs tying a closed bead to its pull
-request. `--unset-metadata rejection_reason` clears any stale rejection
-field from an earlier rejected/reworked attempt before the successful
-close.
+The `--set-metadata` write is ALWAYS required — `pr_url` and `pr_number`
+are the only forensic breadcrumbs tying a bead to its pull request, and
+they must land whether or not the bead is closed. `--unset-metadata
+rejection_reason` clears any stale rejection field from an earlier
+rejected/reworked attempt.
+
+The `gc bd close` is CONDITIONAL, for the same reason it is conditional on
+the direct-merge path: publishing a PR decides the DIFF is handed off, not
+that the BEAD is done. A lane that deliberately left its bead open at
+`validation:pending` has that gate silently cleared otherwise. Re-read the
+labels from the ledger at the point state is advanced and demand a
+well-formed record — `gc bd show` can exit 0 while returning an error
+object, so a bare `.[0].labels` probe evaluates to "not gated" and closes
+the bead anyway. A guard that fails open is not a guard.
+
+Withholding the close is the ENTIRE action. This branch never writes
+validation state and never touches the assignee or routing the gating lane
+set.
 
 ```bash
 gc bd update $WORK \
@@ -1273,8 +1284,30 @@ gc bd update $WORK \
   --set-metadata pr_url="$PR_URL" \
   --set-metadata pr_number="$PR_NUMBER" \
   --set-metadata merged_target="$TARGET" \
-  --unset-metadata rejection_reason && \
-gc bd close $WORK --reason "Pull request ready: $PR_URL"
+  --unset-metadata rejection_reason || {
+  echo "PR metadata write failed for $WORK — STOP. Do not close the bead."
+  gc runtime drain-ack
+  exit 1
+}
+
+vgate_json=$(gc bd show "$WORK" --json 2>/dev/null) || vgate_json=""
+vgate_pending=$(printf '%s\n' "$vgate_json" \
+  | jq -r 'if type == "array" and ((.[0].id? // "") != "")
+           then (((.[0].labels // []) | index("validation:pending")) != null)
+           else "unknown" end' 2>/dev/null || echo unknown)
+case "$vgate_pending" in
+  false)
+    gc bd close $WORK --reason "Pull request ready: $PR_URL"
+    ;;
+  true)
+    echo "mr/pr: $WORK has PR $PR_URL ready but was NOT closed — the bead carries validation:pending, so its own lane is gating the close. The PR metadata stamp landed; leaving status/assignee/routing exactly as that lane set them."
+    ;;
+  *)
+    echo "Could not read labels for $WORK — gc bd show returned no usable record, so it is unknown whether a lane is gating the close. Fail closed: PR ready and stamped, bead NOT closed. STOP. Do not mutate bead state."
+    gc runtime drain-ack
+    exit 1
+    ;;
+esac
 ```
 
 **5. Cleanup:**
