@@ -164,13 +164,20 @@ without catching the mismatch (upstream #1833).
 # (e.g. controller restart, host wake, claim race). Their branch ships
 # but you never see the mail. Scan metadata for orphans before the
 # normal patrol — these are real merge candidates that need rescuing.
+#
+# This scan ENQUEUES. It does not merge. Assigning the orphan to $GC_AGENT
+# is the whole rescue: that is the one field the formula's find-work
+# selector (--assignee=$GC_AGENT --status=open --has-metadata-key=branch)
+# needs, so the orphan merges through merge-push with every gate intact.
+# Merging one inline would run a second, unscripted merge path that skips
+# the label:hold re-read, the 0-diff false-completion guard, and push
+# verification — see gcp-d9w.
 ORPHANS=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --metadata-field gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery" --status=open --json 2>/dev/null \
   | jq -r '.[] | select(.metadata.branch != null) | .id')
 for ORPHAN in $ORPHANS; do
-  echo "orphan-merge candidate: $ORPHAN"
-  # Treat each like a normal mail-driven merge: read metadata, run gates,
-  # ff-merge, close the bead. This is just the regular work — scan only
-  # surfaces beads the inbox missed.
+  echo "orphan-merge candidate, enqueueing for merge-push: $ORPHAN"
+  gc bd update "$ORPHAN" --assignee="$GC_AGENT" \
+    || echo "could not enqueue orphan $ORPHAN; it stays visible to the next scan"
 done
 
 # Step 1: Check for an in-progress patrol wisp
