@@ -49,49 +49,79 @@ are hard to reproduce. A blind restart destroys the evidence. Always:
 
 ```bash
 # Group all four captures under one timestamp so the bundle is easy
-# to attach to the escalation note. Each timed step writes via
-# redirect (not `tee`) so timeout's exit 124 propagates to `||` and
-# the agent gets an explicit "diagnostic timed out" signal — POSIX
-# pipelines mask the upstream exit code via tee.
+# to attach to the escalation note.
 ts=$(date +%s)
 
-# 1. Capture live process state via SQL (non-fatal — Dolt keeps running).
+# Resolve a bounded-run helper ONCE. GNU `timeout` ships with coreutils
+# and is NOT present on a stock macOS host — Homebrew installs it as
+# `gtimeout`. Hard-coding `timeout` makes every wrapped capture die with
+# "command not found" and writes THAT into the evidence file, leaving an
+# empty bundle at the one moment the evidence is irreplaceable. When
+# neither binary exists, run unbounded instead: a slow capture beats no
+# capture during an incident. Mirrors run_bounded() in
+# assets/scripts/status-line.sh.
+if command -v timeout >/dev/null 2>&1; then
+    BOUND=timeout
+elif command -v gtimeout >/dev/null 2>&1; then
+    BOUND=gtimeout
+else
+    BOUND=
+    echo "(no timeout/gtimeout on PATH — captures run unbounded; if one hangs, interrupt it and say so in the escalation)"
+fi
+
+# `capture` runs one evidence step and reports a CONCLUSION, not just a
+# failure. Exit 124 is the bound firing — real evidence that Dolt did not
+# answer. Any other non-zero is the capture command itself breaking, which
+# says nothing about the server. Collapsing the two into one "timed out or
+# failed" message manufactures a false positive for the very condition this
+# recipe exists to diagnose. Each step writes via redirect (not `tee`) so
+# the real exit status survives — a POSIX pipeline reports only the last
+# command's status.
+capture() {   # capture <step> <seconds|-> <file> <cmd...>
+    step=$1 secs=$2 file=$3
+    shift 3
+    bounded=
+    if [ "$secs" != - ] && [ -n "$BOUND" ]; then
+        bounded=1
+    fi
+    if [ -n "$bounded" ]; then
+        "$BOUND" "$secs" "$@" > "$file" 2>&1
+    else
+        "$@" > "$file" 2>&1
+    fi
+    rc=$?
+    # Only a step that actually carried a bound can report 124 as the bound
+    # firing; an unbounded step returning 124 is just the command failing.
+    case "$rc/$bounded" in
+        0/*)   ;;
+        124/1) echo "(step $step: Dolt did not answer within ${secs}s — this IS evidence. See $file.)" ;;
+        *)     echo "(step $step: the capture itself failed, exit $rc — NOT evidence about Dolt. See $file.)" ;;
+    esac
+    cat "$file"
+}
+
+# 1. Live process state via SQL (non-fatal — Dolt keeps running).
 #    SHOW FULL PROCESSLIST lists active connections, the query each is
-#    running, and time-in-state. Bound the call so a wedged server can't
+#    running, and time-in-state. Bound it so a wedged server cannot
 #    block the diagnostic itself.
-timeout 5 gc dolt sql -q "SHOW FULL PROCESSLIST" \
-    > /tmp/dolt-hang-$ts-procs.log 2>&1 \
-  || echo "(step 1 timed out or failed — see procs.log for partial output)"
-cat /tmp/dolt-hang-$ts-procs.log
+capture 1 5 /tmp/dolt-hang-$ts-procs.log gc dolt sql -q "SHOW FULL PROCESSLIST"
 
-# 2. Capture recent server log (timestamps, slow queries, prior crashes).
-#    `gc dolt logs` is a `tail` against an on-disk file — does not
-#    touch the live server, so no outer timeout is needed. Use the
-#    redirect form for the same reason as the other steps: a missing
-#    log file should surface as a "diagnostic failed" signal, not be
-#    masked by the `tee` exit code.
-gc dolt logs -n 500 \
-    > /tmp/dolt-hang-$ts-logs.log 2>&1 \
-  || echo "(step 2 failed — see logs.log; the dolt log file may be missing)"
-cat /tmp/dolt-hang-$ts-logs.log
+# 2. Recent server log (timestamps, slow queries, prior crashes).
+#    `gc dolt logs` is a `tail` against an on-disk file — it does not
+#    touch the live server, so it takes no bound.
+capture 2 - /tmp/dolt-hang-$ts-logs.log gc dolt logs -n 500
 
-# 3. Capture the structured health snapshot. `gc dolt health` bounds
-#    each per-database SQL probe internally with `run_bounded 5`, but
+# 3. Structured health snapshot. `gc dolt health` bounds each
+#    per-database SQL probe internally with `run_bounded 5`, but
 #    worst-case wall time is roughly 5s + 5s × N_databases. 60s covers
-#    cities up to ~10 databases at the limit; if the timeout fires,
-#    treat it as evidence the data plane is wedged and escalate.
-timeout 60 gc dolt health --json \
-    > /tmp/dolt-hang-$ts-health.json 2>&1 \
-  || echo "(step 3 timed out or failed — see health.json for partial output)"
-cat /tmp/dolt-hang-$ts-health.json
+#    cities up to ~10 databases at the limit; if the bound fires, treat
+#    it as evidence the data plane is wedged and escalate.
+capture 3 60 /tmp/dolt-hang-$ts-health.json gc dolt health --json
 
-# 4. Capture reachability + PID for the escalation note. Bound the
-#    call: `gc dolt status` probes /dev/tcp, which can stall on a
-#    server that accepts connections but never speaks MySQL.
-timeout 10 gc dolt status \
-    > /tmp/dolt-hang-$ts-status.log 2>&1 \
-  || echo "(step 4 timed out or failed — see status.log for partial output)"
-cat /tmp/dolt-hang-$ts-status.log
+# 4. Reachability + PID for the escalation note. Bound it: `gc dolt
+#    status` probes /dev/tcp, which can stall on a server that accepts
+#    connections but never speaks MySQL.
+capture 4 10 /tmp/dolt-hang-$ts-status.log gc dolt status
 
 # 5. THEN escalate with the evidence.
 gc mail send mayor -s "Dolt: <describe symptom>" -m "<paste evidence>"

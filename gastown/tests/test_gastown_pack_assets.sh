@@ -331,6 +331,145 @@ if problems:
 PY
 }
 
+# Extract the Dolt incident-diagnostic recipe (the fenced block that captures
+# SHOW FULL PROCESSLIST) out of the operational-awareness fragment so the test
+# executes the exact shell agents are told to paste, not a paraphrase of it.
+extract_dolt_recipe() {
+    python3 - "$1" <<'EXTRACT_PY'
+import pathlib
+import sys
+
+lines = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+blocks = []
+current = None
+for line in lines:
+    if line.startswith("```"):
+        if current is None:
+            current = []
+        else:
+            blocks.append("\n".join(current))
+            current = None
+        continue
+    if current is not None:
+        current.append(line)
+
+matches = [b for b in blocks if "SHOW FULL PROCESSLIST" in b]
+if len(matches) != 1:
+    raise SystemExit(
+        f"expected exactly one PROCESSLIST recipe block, found {len(matches)}"
+    )
+print(matches[0])
+EXTRACT_PY
+}
+
+# Build an isolated PATH holding only what the recipe may legitimately reach:
+# a `gc` stub, `cat`, a pinned `date`, and whichever bounded-run binaries this
+# scenario declares. Anything absent here is genuinely absent — that is how we
+# reproduce a stock macOS host, where GNU coreutils is not installed.
+write_dolt_recipe_stubs() {
+    local bin="$1" stamp="$2" gc_rc="$3"
+    shift 3
+    mkdir -p "$bin"
+
+    ln -sf /bin/cat "$bin/cat"
+
+    cat >"$bin/date" <<DATE_SH
+#!/bin/sh
+printf '%s\n' "$stamp"
+DATE_SH
+    chmod +x "$bin/date"
+
+    cat >"$bin/gc" <<GC_SH
+#!/bin/sh
+# NOTE: this heredoc is unquoted so gc_rc/stamp interpolate, which means
+# backticks here would be command-substituted and would run the REAL gc.
+# Keep this comment backtick-free.
+# Only the dolt captures fail; mail send still works, so the test isolates
+# the capture-reporting contract from the escalation path. Anchored at the
+# start so the literal "Dolt:" in the mail subject cannot match.
+case "\$*" in
+    dolt*) [ "$gc_rc" -eq 0 ] || exit $gc_rc ;;
+esac
+case "\$*" in
+    *"SHOW FULL PROCESSLIST"*) printf '| 879157 | bd | %% | gcy | Sleep | 0 |\n' ;;
+    *"dolt logs"*)             printf 'dolt-log-line\n' ;;
+    *"dolt health"*)           printf '{"running":true}\n' ;;
+    *"dolt status"*)           printf 'dolt-status-line\n' ;;
+    *"mail send"*)             printf 'mail-sent\n' ;;
+esac
+GC_SH
+    chmod +x "$bin/gc"
+
+    local name
+    for name in "$@"; do
+        cat >"$bin/$name" <<'BOUND_SH'
+#!/bin/sh
+printf '%s\n' "${0##*/}" >>"$TIMEOUT_LOG"
+shift
+exec "$@"
+BOUND_SH
+        chmod +x "$bin/$name"
+    done
+}
+
+test_dolt_diagnostic_recipe_survives_missing_gnu_timeout() {
+    local fragment recipe tmp bin stamp out log
+    fragment="$GASTOWN/template-fragments/operational-awareness.template.md"
+    recipe=$(extract_dolt_recipe "$fragment") ||
+        fail "could not extract the Dolt diagnostic recipe from the fragment"
+
+    # --- Scenario A: stock macOS. Neither `timeout` nor `gtimeout` exists. ---
+    tmp=$(mktemp -d)
+    bin="$tmp/bin"
+    stamp="itt-none-$$"
+    log="$tmp/bounded.log"
+    write_dolt_recipe_stubs "$bin" "$stamp" 0
+    out=$(TIMEOUT_LOG="$log" PATH="$bin" /bin/sh -c "$recipe" 2>&1) ||
+        fail "recipe exited non-zero with no bounded-run binary available"
+
+    grep -F '879157' "/tmp/dolt-hang-$stamp-procs.log" >/dev/null ||
+        fail "evidence bundle lost the PROCESSLIST capture when GNU timeout was absent"
+    ! grep -Fi 'not found' "/tmp/dolt-hang-$stamp-procs.log" >/dev/null ||
+        fail "evidence bundle captured a shell 'command not found' error instead of Dolt state"
+    grep -Fi 'unbounded' <<<"$out" >/dev/null ||
+        fail "recipe must say diagnostics are running unbounded when no timeout binary exists"
+    ! grep -Fi 'step 1 timed out' <<<"$out" >/dev/null ||
+        fail "a missing diagnostic tool must not be reported as Dolt failing to respond"
+    rm -f "/tmp/dolt-hang-$stamp-"*
+
+    # --- Scenario B: Homebrew coreutils, which installs `gtimeout` only. ---
+    tmp=$(mktemp -d)
+    bin="$tmp/bin"
+    stamp="itt-gtimeout-$$"
+    log="$tmp/bounded.log"
+    write_dolt_recipe_stubs "$bin" "$stamp" 0 gtimeout
+    out=$(TIMEOUT_LOG="$log" PATH="$bin" /bin/sh -c "$recipe" 2>&1) ||
+        fail "recipe exited non-zero with only gtimeout available"
+
+    grep -F '879157' "/tmp/dolt-hang-$stamp-procs.log" >/dev/null ||
+        fail "evidence bundle lost the PROCESSLIST capture when only gtimeout was available"
+    grep -Fx 'gtimeout' "$log" >/dev/null ||
+        fail "recipe must bound its captures via gtimeout when that is the available binary"
+    rm -f "/tmp/dolt-hang-$stamp-"*
+
+    # --- Scenario C: a genuinely wedged server. The bound fires (exit 124). ---
+    tmp=$(mktemp -d)
+    bin="$tmp/bin"
+    stamp="itt-wedged-$$"
+    log="$tmp/bounded.log"
+    write_dolt_recipe_stubs "$bin" "$stamp" 124 timeout
+    out=$(TIMEOUT_LOG="$log" PATH="$bin" /bin/sh -c "$recipe" 2>&1) ||
+        fail "recipe exited non-zero against a wedged server"
+
+    grep -F 'step 1: Dolt did not answer within 5s' <<<"$out" >/dev/null ||
+        fail "a bounded exit-124 capture must be reported as the server failing to answer"
+    ! grep -F 'within -s' <<<"$out" >/dev/null ||
+        fail "an unbounded step must not claim a bound fired"
+    ! grep -Fi 'unbounded' <<<"$out" >/dev/null ||
+        fail "a wedged server must not be reported as a missing diagnostic tool"
+    rm -f "/tmp/dolt-hang-$stamp-"*
+}
+
 test_retractions_are_durable_deliverables() {
     local ledger
     ledger="$GASTOWN/template-fragments/capability-ledger.template.md"
@@ -419,5 +558,6 @@ test_refinery_direct_merge_is_worktree_safe_and_fail_closed
 test_next_iteration_excludes_current_wisp_from_successor_queries
 test_orphan_salvage_stages_work_paths_and_bypasses_lint_hook
 test_retractions_are_durable_deliverables
+test_dolt_diagnostic_recipe_survives_missing_gnu_timeout
 
 echo "gastown pack asset tests passed"
