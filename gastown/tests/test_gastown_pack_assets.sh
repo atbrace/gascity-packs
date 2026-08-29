@@ -252,9 +252,11 @@ test_next_iteration_excludes_current_wisp_from_successor_queries() {
 
     # Guard every sibling site: once a shell block resolves CURRENT_WISP, any
     # open-molecule query in that block is deriving a successor and must filter
-    # the current wisp out. The startup reconcilers, which union open and
-    # in_progress to pick one wisp to resume, never set CURRENT_WISP and are
-    # correctly exempt.
+    # the current wisp out. Two kinds of query are correctly exempt. The startup
+    # reconcilers union open and in_progress to pick one wisp to resume and never
+    # set CURRENT_WISP. And the resolver that *assigns* CURRENT_WISP is computing
+    # the current wisp, not a successor -- CURRENT_WISP is empty by construction
+    # on that line, so excluding it would filter on the empty string.
     python3 - "$GASTOWN" <<'PY' || fail "successor wisp query does not exclude CURRENT_WISP"
 import pathlib
 import re
@@ -265,6 +267,7 @@ open_fence = re.compile(r"^\s*```bash\s*$")
 close_fence = re.compile(r"^\s*```\s*$")
 QUERY = "--status=open --type=molecule"
 EXCLUSION = "select(.id != $cur)"
+ASSIGNMENT = re.compile(r"^\s*CURRENT_WISP=")
 
 violations = []
 for path in sorted(root.rglob("*")):
@@ -281,7 +284,9 @@ for path in sorted(root.rglob("*")):
                 violations += [
                     f"{path.relative_to(root)}:{where}: {entry.strip()}"
                     for entry, where in block
-                    if QUERY in entry and EXCLUSION not in entry
+                    if QUERY in entry
+                    and EXCLUSION not in entry
+                    and not ASSIGNMENT.match(entry)
                 ]
             block = None
             continue
