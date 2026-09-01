@@ -354,14 +354,23 @@ discards the very work this step exists to rescue. Do not read
 `gc.work_dir` either: that is the agent's home directory, not the
 per-bead worktree, and cleaning it up would delete the agent's workspace.
 
-Check the bead and worktree state, then act:
+Check the bead and worktree state, then act. **Before applying Case A or B's
+shortcut, if `$WORKTREE` exists on disk, check it for anything not yet on the
+recorded branch — a branch already on origin does not prove the worktree has
+nothing further to salvage:**
+```bash
+[ -n "$WORKTREE" ] && [ -d "$WORKTREE" ] && git -C "$WORKTREE" status --porcelain
+```
+If that has output, treat it as Case C/D instead (commit + push the remainder)
+before proceeding to Step 3 — never delete a dirty worktree.
 
-**Case A: Branch exists on origin (work already published).**
+**Case A: Branch exists on origin (work already published) and the worktree
+(if any) is clean.**
 Worktree is disposable — canonical work is on the branch.
 ```bash
 git ls-remote --heads origin $BRANCH  # Verify branch exists on remote
 ```
-If branch exists on origin → skip to Step 3 (cleanup).
+If branch exists on origin and the worktree is clean → skip to Step 3 (cleanup).
 
 **Case B: Worktree exists, branch pushed but not on origin yet.**
 Branch is recorded in metadata but polecat may have crashed before push.
@@ -369,8 +378,8 @@ Branch is recorded in metadata but polecat may have crashed before push.
 cd "$WORKTREE"
 git ls-remote --heads origin $BRANCH
 ```
-If branch IS on origin → skip to Step 3.
-If branch is NOT on origin → fall through to Case C.
+If branch IS on origin and the worktree is clean → skip to Step 3.
+If branch is NOT on origin, or the worktree is dirty → fall through to Case C.
 
 **Salvage commit rules — apply to Case C and Case D.**
 
