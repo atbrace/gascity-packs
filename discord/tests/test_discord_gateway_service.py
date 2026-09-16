@@ -1896,7 +1896,7 @@ class DiscordGatewayServiceTests(unittest.TestCase):
             "author": {"id": "u-11", "username": "alice"},
         }
 
-        def fake_discord_api_request(method, path, payload=None, bot_token=None):
+        def fake_discord_api_request(method, path, payload=None, bot_token=None, **_kwargs):
             if "?before=" in path:
                 return [
                     {"id": "514", "author": {"username": "alice"}, "content": "second question here"},
@@ -1970,6 +1970,22 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         remaining_ids = [item["id"] for item in capped["recent_messages"]]
         self.assertEqual(remaining_ids, ["3"])
         self.assertEqual(capped["channel_name"], "Support Thread")
+
+    def test_cap_context_bytes_keeps_starter_and_drops_oldest_non_starter_first(self) -> None:
+        context = {
+            "channel_name": "Support Thread",
+            "recent_messages": [
+                {"id": "starter-1", "author": "alice", "content": "s" * 500, "starter": True},
+                {"id": "2", "author": "bob", "content": "b" * 500},
+                {"id": "3", "author": "carol", "content": "c" * 500},
+            ],
+        }
+
+        capped = gateway_service.cap_context_bytes(context, max_bytes=1200)
+
+        self.assertLessEqual(len(json.dumps(capped).encode("utf-8")), 1200)
+        remaining_ids = [item["id"] for item in capped["recent_messages"]]
+        self.assertEqual(remaining_ids, ["starter-1", "3"])
 
     def test_process_inbound_ambient_room_message_routes_targeted_alias_without_bot_mention(self) -> None:
         common.set_chat_binding(

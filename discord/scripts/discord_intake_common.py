@@ -2239,6 +2239,9 @@ def discord_api_request(
     path: str,
     payload: Any = None,
     bot_token: str | None = None,
+    *,
+    timeout: float = 20,
+    max_retries: int | None = None,
 ) -> Any:
     if path.startswith("http://") or path.startswith("https://"):
         url = path
@@ -2256,14 +2259,15 @@ def discord_api_request(
         body = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
-    for attempt in range(DISCORD_RATE_LIMIT_RETRIES + 1):
+    retries = DISCORD_RATE_LIMIT_RETRIES if max_retries is None else max_retries
+    for attempt in range(retries + 1):
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw = response.read()
             break
         except urllib.error.HTTPError as exc:
             raw = exc.read()
-            if exc.code == 429 and attempt < DISCORD_RATE_LIMIT_RETRIES:
+            if exc.code == 429 and attempt < retries:
                 retry_after = discord_retry_after_seconds(exc, raw)
                 time.sleep(retry_after)
                 continue

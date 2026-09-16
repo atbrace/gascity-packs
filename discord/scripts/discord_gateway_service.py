@@ -332,6 +332,8 @@ def fetch_message_via_rest(
 
 RECENT_CONTEXT_MESSAGE_LIMIT = 10
 RECENT_CONTEXT_MESSAGE_CHARS = 300
+RECENT_CONTEXT_FETCH_TIMEOUT_SECONDS = 5
+RECENT_CONTEXT_FETCH_MAX_RETRIES = 0
 
 
 def fetch_recent_context(
@@ -348,29 +350,34 @@ def fetch_recent_context(
     entries: list[dict[str, str]] = []
     seen_ids: set[str] = set()
 
-    def add_entry(raw: Any) -> None:
+    def add_entry(raw: Any, *, starter: bool = False) -> None:
         if not isinstance(raw, dict):
             return
         raw_id = str(raw.get("id", "")).strip()
         if not raw_id or raw_id in seen_ids:
             return
         seen_ids.add(raw_id)
-        entries.append(
-            {
-                "id": raw_id,
-                "author": display_name_from_message(raw),
-                "content": summarize_body(raw_message_content(raw), RECENT_CONTEXT_MESSAGE_CHARS),
-            }
-        )
+        entry = {
+            "id": raw_id,
+            "author": display_name_from_message(raw),
+            "content": summarize_body(raw_message_content(raw), RECENT_CONTEXT_MESSAGE_CHARS),
+        }
+        if starter:
+            entry["starter"] = True
+        entries.append(entry)
 
     if channel_type in common.THREAD_CHANNEL_TYPES:
         # Forum-post starter messages reuse the thread's own id as the message id.
         quoted_starter = urllib.parse.quote(normalized_channel_id)
         try:
-            starter = common.discord_api_request(
-                "GET", f"/channels/{quoted_channel}/messages/{quoted_starter}", bot_token=bot_token
+            starter_message = common.discord_api_request(
+                "GET",
+                f"/channels/{quoted_channel}/messages/{quoted_starter}",
+                bot_token=bot_token,
+                timeout=RECENT_CONTEXT_FETCH_TIMEOUT_SECONDS,
+                max_retries=RECENT_CONTEXT_FETCH_MAX_RETRIES,
             )
-            add_entry(starter)
+            add_entry(starter_message, starter=True)
         except common.DiscordAPIError:
             pass
 
@@ -380,6 +387,8 @@ def fetch_recent_context(
                 "GET",
                 f"/channels/{quoted_channel}/messages?before={urllib.parse.quote(normalized_message_id)}&limit={RECENT_CONTEXT_MESSAGE_LIMIT}",
                 bot_token=bot_token,
+                timeout=RECENT_CONTEXT_FETCH_TIMEOUT_SECONDS,
+                max_retries=RECENT_CONTEXT_FETCH_MAX_RETRIES,
             )
         except common.DiscordAPIError:
             return entries
@@ -393,7 +402,10 @@ def cap_context_bytes(context: dict[str, Any], max_bytes: int = 4000) -> dict[st
     messages = list(context.get("recent_messages") or [])
     capped = {**context, "recent_messages": messages}
     while messages and len(json.dumps(capped).encode("utf-8")) > max_bytes:
-        messages.pop(0)
+        # Drop the oldest non-starter message first; the forum-post starter (if present,
+        # always first) is the last one dropped, since it's the anchor for the thread.
+        drop_index = 1 if len(messages) > 1 and messages[0].get("starter") else 0
+        messages.pop(drop_index)
         capped = {**context, "recent_messages": messages}
     return capped
 
