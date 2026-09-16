@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pathlib
 import struct
 import tempfile
@@ -1871,6 +1872,105 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         self.assertEqual(outcome["reason"], "channel_not_allowed")
         deliver_session_message.assert_not_called()
 
+    @staticmethod
+    def _envelope_context(envelope: str) -> dict:
+        context_line = next(line for line in envelope.splitlines() if line.startswith("untrusted_context_json:"))
+        return json.loads(context_line[len("untrusted_context_json:"):].strip())
+
+    def test_process_inbound_mentioned_thread_message_includes_recent_context(self) -> None:
+        common.set_chat_binding(
+            common.load_config(),
+            "room",
+            "222",
+            ["sky"],
+            guild_id="1",
+            channel_metadata={"channel_type": 11, "thread_parent_id": "22", "name": "Support Thread"},
+        )
+        common.save_bot_token("bot-token")
+        message = {
+            "id": "515",
+            "guild_id": "1",
+            "channel_id": "222",
+            "content": "<@999> ^^",
+            "mentions": [{"id": "999"}],
+            "author": {"id": "u-11", "username": "alice"},
+        }
+
+        def fake_discord_api_request(method, path, payload=None, bot_token=None):
+            if "?before=" in path:
+                return [
+                    {"id": "514", "author": {"username": "alice"}, "content": "second question here"},
+                    {"id": "513", "author": {"username": "bob"}, "content": "first reply here"},
+                ]
+            return {"id": "222", "author": {"username": "alice"}, "content": "starter message content"}
+
+        with mock.patch.object(common, "discord_api_request", side_effect=fake_discord_api_request), mock.patch.object(
+            common,
+            "session_index_by_name",
+            return_value={"sky": {"session_name": "sky", "state": "active"}},
+        ), mock.patch.object(common, "deliver_session_message", return_value={"status": "accepted"}) as deliver_session_message:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "delivered")
+        envelope = deliver_session_message.call_args.args[1]
+        self.assertIn("untrusted_body_json:", envelope)
+        context = self._envelope_context(envelope)
+        self.assertEqual(context["channel_name"], "Support Thread")
+        ids = [item["id"] for item in context["recent_messages"]]
+        self.assertEqual(ids, ["222", "513", "514"])
+        for item in context["recent_messages"]:
+            self.assertLessEqual(len(item["content"]), 300)
+
+    def test_process_inbound_mentioned_message_context_survives_rest_failure(self) -> None:
+        common.set_chat_binding(
+            common.load_config(),
+            "room",
+            "222",
+            ["sky"],
+            guild_id="1",
+            channel_metadata={"channel_type": 11, "thread_parent_id": "22"},
+        )
+        common.save_bot_token("bot-token")
+        message = {
+            "id": "516",
+            "guild_id": "1",
+            "channel_id": "222",
+            "content": "<@999> ^^",
+            "mentions": [{"id": "999"}],
+            "author": {"id": "u-12", "username": "alice"},
+        }
+
+        with mock.patch.object(
+            common, "discord_api_request", side_effect=common.DiscordAPIError("GET failed", status_code=500)
+        ), mock.patch.object(
+            common,
+            "session_index_by_name",
+            return_value={"sky": {"session_name": "sky", "state": "active"}},
+        ), mock.patch.object(common, "deliver_session_message", return_value={"status": "accepted"}) as deliver_session_message:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "delivered")
+        envelope = deliver_session_message.call_args.args[1]
+        context = self._envelope_context(envelope)
+        self.assertEqual(context["recent_messages"], [])
+
+    def test_cap_context_bytes_drops_oldest_messages_first(self) -> None:
+        context = {
+            "channel_name": "Support Thread",
+            "recent_messages": [
+                {"id": "1", "author": "alice", "content": "a" * 500},
+                {"id": "2", "author": "bob", "content": "b" * 500},
+                {"id": "3", "author": "carol", "content": "c" * 500},
+            ],
+        }
+
+        capped = gateway_service.cap_context_bytes(context, max_bytes=900)
+
+        self.assertLessEqual(len(json.dumps(capped).encode("utf-8")), 900)
+        remaining_ids = [item["id"] for item in capped["recent_messages"]]
+        self.assertEqual(remaining_ids, ["3"])
+        self.assertEqual(capped["channel_name"], "Support Thread")
+
     def test_process_inbound_ambient_room_message_routes_targeted_alias_without_bot_mention(self) -> None:
         common.set_chat_binding(
             common.load_config(),
@@ -2031,7 +2131,11 @@ class DiscordGatewayServiceTests(unittest.TestCase):
             outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
 
         self.assertEqual(outcome["status"], "delivered")
-        discord_api_request.assert_called_once()
+        # One channel-info fallback lookup for the missing thread_parent_id metadata, plus
+        # the mentioned-delivery recent-context fetch (thread starter + before-list).
+        lookup_calls = [call for call in discord_api_request.call_args_list if call.args[1] == "/channels/222"]
+        self.assertEqual(len(lookup_calls), 1)
+        self.assertEqual(discord_api_request.call_count, 3)
         deliver_session_message.assert_called_once()
         envelope = deliver_session_message.call_args.args[1]
         self.assertIn("conversation: guild:1 channel:22 thread:222", envelope)
@@ -2262,7 +2366,10 @@ class DiscordGatewayServiceTests(unittest.TestCase):
             outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
 
         self.assertEqual(outcome["status"], "delivered")
-        discord_api_request.assert_not_called()
+        # No channel-info lookup happens for a bound, non-thread main room; the one call
+        # here is the mentioned-delivery recent-context fetch, not a channel-info fetch.
+        discord_api_request.assert_called_once()
+        self.assertIn("/messages?before=", discord_api_request.call_args.args[1])
         deliver_session_message.assert_called_once()
 
     def test_process_inbound_legacy_main_room_binding_survives_lookup_failure(self) -> None:
@@ -2317,7 +2424,11 @@ class DiscordGatewayServiceTests(unittest.TestCase):
             first_outcome = gateway_service.process_inbound_message(first_message, bot_user_id="999")
 
         self.assertEqual(first_outcome["status"], "delivered")
-        discord_api_request.assert_called_once()
+        # One channel-info lookup (cached below), plus the mentioned-delivery recent-context
+        # fetch (channel 22 is not a thread, so no starter-message fetch).
+        lookup_calls = [call for call in discord_api_request.call_args_list if call.args[1] == "/channels/22"]
+        self.assertEqual(len(lookup_calls), 1)
+        self.assertEqual(discord_api_request.call_count, 2)
         deliver_session_message.assert_called_once()
         binding = common.resolve_chat_binding(common.load_config(), common.chat_binding_id("room", "22"))
         assert binding is not None
@@ -2334,7 +2445,10 @@ class DiscordGatewayServiceTests(unittest.TestCase):
             second_outcome = gateway_service.process_inbound_message(second_message, bot_user_id="999")
 
         self.assertEqual(second_outcome["status"], "delivered")
-        discord_api_request.assert_not_called()
+        # The channel-info lookup is cached (no "/channels/22" call); only the
+        # mentioned-delivery recent-context fetch runs.
+        discord_api_request.assert_called_once()
+        self.assertIn("/messages?before=", discord_api_request.call_args.args[1])
         deliver_session_message.assert_called_once()
 
     def test_persist_binding_channel_metadata_writes_runtime_cache_without_rewriting_binding(self) -> None:
@@ -3267,7 +3381,12 @@ class DiscordGatewayServiceTests(unittest.TestCase):
 
         self.assertEqual(outcome_1["status"], "delivered")
         self.assertEqual(outcome_2["status"], "delivered")
-        discord_api_request.assert_called_once()
+        # The thread-parent lookup itself is cached across both messages (one call); the
+        # mentioned-delivery recent-context fetch (starter + before-list) runs uncached
+        # for each message.
+        lookup_calls = [call for call in discord_api_request.call_args_list if call.args[1] == "/channels/222"]
+        self.assertEqual(len(lookup_calls), 1)
+        self.assertEqual(discord_api_request.call_count, 5)
 
     def test_load_channel_info_serializes_cache_fill(self) -> None:
         entered = threading.Event()

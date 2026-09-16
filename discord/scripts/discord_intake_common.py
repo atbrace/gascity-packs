@@ -337,6 +337,9 @@ def normalize_binding_channel_metadata(value: dict[str, Any] | None = None) -> d
         parent_id = str(raw.get("thread_parent_id", raw.get("parent_id", ""))).strip()
         if parent_id:
             normalized["thread_parent_id"] = parent_id
+    channel_name = str(raw.get("name", raw.get("channel_name", ""))).strip()
+    if channel_name:
+        normalized["channel_name"] = channel_name
     return normalized
 
 

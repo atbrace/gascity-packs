@@ -330,6 +330,74 @@ def fetch_message_via_rest(
     return {}
 
 
+RECENT_CONTEXT_MESSAGE_LIMIT = 10
+RECENT_CONTEXT_MESSAGE_CHARS = 300
+
+
+def fetch_recent_context(
+    channel_id: str,
+    message_id: str,
+    bot_token: str,
+    channel_type: int = 0,
+) -> list[dict[str, str]]:
+    normalized_channel_id = str(channel_id).strip()
+    normalized_message_id = str(message_id).strip()
+    if not normalized_channel_id or not bot_token:
+        return []
+    quoted_channel = urllib.parse.quote(normalized_channel_id)
+    entries: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+
+    def add_entry(raw: Any) -> None:
+        if not isinstance(raw, dict):
+            return
+        raw_id = str(raw.get("id", "")).strip()
+        if not raw_id or raw_id in seen_ids:
+            return
+        seen_ids.add(raw_id)
+        entries.append(
+            {
+                "id": raw_id,
+                "author": display_name_from_message(raw),
+                "content": summarize_body(raw_message_content(raw), RECENT_CONTEXT_MESSAGE_CHARS),
+            }
+        )
+
+    if channel_type in common.THREAD_CHANNEL_TYPES:
+        # Forum-post starter messages reuse the thread's own id as the message id.
+        quoted_starter = urllib.parse.quote(normalized_channel_id)
+        try:
+            starter = common.discord_api_request(
+                "GET", f"/channels/{quoted_channel}/messages/{quoted_starter}", bot_token=bot_token
+            )
+            add_entry(starter)
+        except common.DiscordAPIError:
+            pass
+
+    if normalized_message_id:
+        try:
+            payload = common.discord_api_request(
+                "GET",
+                f"/channels/{quoted_channel}/messages?before={urllib.parse.quote(normalized_message_id)}&limit={RECENT_CONTEXT_MESSAGE_LIMIT}",
+                bot_token=bot_token,
+            )
+        except common.DiscordAPIError:
+            return entries
+        if isinstance(payload, list):
+            for raw in reversed(payload):  # Discord returns newest-first; we want oldest-first
+                add_entry(raw)
+    return entries
+
+
+def cap_context_bytes(context: dict[str, Any], max_bytes: int = 4000) -> dict[str, Any]:
+    messages = list(context.get("recent_messages") or [])
+    capped = {**context, "recent_messages": messages}
+    while messages and len(json.dumps(capped).encode("utf-8")) > max_bytes:
+        messages.pop(0)
+        capped = {**context, "recent_messages": messages}
+    return capped
+
+
 def recover_message_for_routing(
     message: dict[str, Any],
     *,
@@ -808,6 +876,7 @@ def build_human_envelope(
     mentioned_aliases: list[str],
     delivery: str,
     ingress_id: str,
+    context: dict[str, Any] | None = None,
 ) -> str:
     conversation_value, conversation_key = conversation_fields(message, channel_info)
     binding_id = str(binding.get("id", "")).strip()
@@ -827,6 +896,10 @@ def build_human_envelope(
         f"delivery: {delivery}",
         f"mentioned_aliases_json: {json.dumps(mentioned_aliases)}",
         f"untrusted_body_json: {json.dumps(body)}",
+    ]
+    if context is not None:
+        lines.append(f"untrusted_context_json: {json.dumps(context)}")
+    lines.extend([
         f"publish_binding_id: {binding_id}",
         f"publish_conversation_id: {channel_id}",
         f"publish_trigger_id: {message_id}",
@@ -837,7 +910,7 @@ def build_human_envelope(
         "reply_success_signal: record.remote_message_id",
         "reply_turn_requirement: if you intend to answer, do not end the turn without a successful reply-current",
         "</discord-event>",
-    ]
+    ])
     return "\n".join(lines)
 
 
@@ -2119,6 +2192,27 @@ def process_inbound_message(
             )
             return {"status": "skipped_no_targets", "ingress_id": ingress_id, "receipt": receipt}
 
+        context: dict[str, Any] | None = None
+        if mentioned_bot:
+            channel_type_for_context = channel_info.get("type", channel_info.get("channel_type"))
+            if channel_type_for_context is None:
+                channel_type_for_context = binding.get("channel_type", 0)
+            try:
+                channel_type_for_context = int(channel_type_for_context or 0)
+            except (TypeError, ValueError):
+                channel_type_for_context = 0
+            context_bot_token = common.load_bot_token(normalized_app_name)
+            recent_messages = fetch_recent_context(
+                channel_id,
+                str(message.get("id", "")).strip(),
+                context_bot_token,
+                channel_type_for_context,
+            )
+            context_channel_name = (
+                str(channel_info.get("name", "")).strip() or str(binding.get("channel_name", "")).strip()
+            )
+            context = cap_context_bytes({"channel_name": context_channel_name, "recent_messages": recent_messages})
+
         envelope = build_human_envelope(
             binding=binding,
             message=message,
@@ -2127,6 +2221,7 @@ def process_inbound_message(
             mentioned_aliases=mentioned_aliases,
             delivery=delivery,
             ingress_id=ingress_id,
+            context=context,
         )
         receipt = persist_ingress_receipt(
             {
