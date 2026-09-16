@@ -620,28 +620,28 @@ def resolve_binding(
         binding.update(common.normalize_binding_channel_metadata(looked_up_channel_info))
         persist_binding_channel_metadata(binding)
         return binding, binding_channel_info(binding)
-    guild_binding = common.resolve_chat_binding(
-        config, common.chat_binding_id("guild", guild_id, normalized_app_name)
-    )
-    if guild_binding:
-        return guild_binding, channel_info
+    def guild_fallback() -> dict[str, Any] | None:
+        return common.resolve_chat_binding(config, common.chat_binding_id("guild", guild_id, normalized_app_name))
+
     bot_token = common.load_bot_token(normalized_app_name)
     if not bot_token:
-        return None, channel_info
+        return guild_fallback(), channel_info
     try:
         channel_info = load_channel_info(channel_id, bot_token)
     except common.DiscordAPIError as exc:
         if exc.status_code == 404:
-            return None, {}
+            return guild_fallback(), {}
         raise
     if not isinstance(channel_info, dict):
-        return common.resolve_chat_binding(config, common.chat_binding_id("room", channel_id, normalized_app_name)), {}
+        binding = common.resolve_chat_binding(config, common.chat_binding_id("room", channel_id, normalized_app_name))
+        return binding or guild_fallback(), {}
     parent_id = str(channel_info.get("parent_id", "")).strip()
     if parent_id and parent_id != channel_id:
         binding = common.resolve_chat_binding(config, common.chat_binding_id("room", parent_id, normalized_app_name))
         if binding:
             return binding, channel_info
-    return common.resolve_chat_binding(config, common.chat_binding_id("room", channel_id, normalized_app_name)), channel_info
+    binding = common.resolve_chat_binding(config, common.chat_binding_id("room", channel_id, normalized_app_name))
+    return binding or guild_fallback(), channel_info
 
 
 def resolve_targets(
