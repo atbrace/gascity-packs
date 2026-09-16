@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import pathlib
 import struct
+import subprocess
 import tempfile
 import threading
 import time
@@ -1986,6 +1987,176 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         self.assertLessEqual(len(json.dumps(capped).encode("utf-8")), 1200)
         remaining_ids = [item["id"] for item in capped["recent_messages"]]
         self.assertEqual(remaining_ids, ["starter-1", "3"])
+
+    def test_process_inbound_routed_author_dispatches_bead_instead_of_session(self) -> None:
+        common.set_chat_binding(
+            common.load_config(),
+            "room",
+            "22",
+            ["sky"],
+            guild_id="1",
+            dispatch_authors=["9001"],
+            dispatch_workdir="/repo/sysadmin",
+        )
+        common.save_bot_token("bot-token")
+        message = {
+            "id": "601",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "<@999> restart the pihole exporter and tell me when it's back",
+            "mentions": [{"id": "999"}],
+            "author": {"id": "9001", "username": "austin"},
+        }
+
+        def fake_run(argv, cwd=None, env=None, timeout=None, capture_output=None, text=None):
+            self.assertEqual(cwd, "/repo/sysadmin")
+            self.assertNotIn("BEADS_DIR", env)
+            self.assertNotIn("BEADS_DB", env)
+            if argv[:2] == ["bd", "create"]:
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"id": "sys-abc123"}), stderr="")
+            if argv[:2] == ["bd", "tag"]:
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if argv[:2] == ["./bin/tools", "dispatch"]:
+                return subprocess.CompletedProcess(argv, 0, stdout='{"admitted": true}', stderr="")
+            raise AssertionError(f"unexpected subprocess call: {argv}")
+
+        with mock.patch.object(gateway_service.subprocess, "run", side_effect=fake_run) as run_mock, mock.patch.object(
+            common, "post_channel_message"
+        ) as post_channel_message, mock.patch.object(
+            common, "deliver_session_message"
+        ) as deliver_session_message, mock.patch.object(common, "discord_api_request", return_value=[]):
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "dispatched")
+        self.assertEqual(outcome["bead_id"], "sys-abc123")
+        self.assertEqual(run_mock.call_count, 3)
+        post_channel_message.assert_called_once()
+        self.assertEqual(post_channel_message.call_args.args[1], "filed sys-abc123, dispatched")
+        deliver_session_message.assert_not_called()
+        create_call = run_mock.call_args_list[0]
+        self.assertEqual(create_call.args[0][:2], ["bd", "create"])
+        self.assertIn("restart the pihole exporter", create_call.args[0][create_call.args[0].index("--title") + 1])
+        description = create_call.args[0][create_call.args[0].index("--description") + 1]
+        self.assertIn("untrusted_body_json:", description)
+        self.assertIn("untrusted_context_json:", description)
+        self.assertIn("from_user_id: 9001", description)
+        tag_call = run_mock.call_args_list[1]
+        self.assertEqual(tag_call.args[0], ["bd", "tag", "sys-abc123", "discord-request"])
+        dispatch_call = run_mock.call_args_list[2]
+        self.assertEqual(dispatch_call.args[0], ["./bin/tools", "dispatch", "sys-abc123"])
+        receipt = common.load_chat_ingress("in-601")
+        assert receipt is not None
+        self.assertEqual(receipt["status"], "dispatched")
+        self.assertEqual(receipt["dispatch_bead_id"], "sys-abc123")
+
+    def test_process_inbound_non_routed_author_on_dispatch_binding_delivers_normally(self) -> None:
+        common.set_chat_binding(
+            common.load_config(),
+            "room",
+            "22",
+            ["sky"],
+            guild_id="1",
+            dispatch_authors=["9001"],
+            dispatch_workdir="/repo/sysadmin",
+        )
+        message = {
+            "id": "602",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "<@999> what's the status?",
+            "mentions": [{"id": "999"}],
+            "author": {"id": "9002", "username": "someone-else"},
+        }
+
+        with mock.patch.object(gateway_service.subprocess, "run") as run_mock, mock.patch.object(
+            common,
+            "session_index_by_name",
+            return_value={"sky": {"session_name": "sky", "state": "active"}},
+        ), mock.patch.object(
+            common, "deliver_session_message", return_value={"status": "accepted"}
+        ) as deliver_session_message, mock.patch.object(common, "discord_api_request", return_value=[]):
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "delivered")
+        deliver_session_message.assert_called_once()
+        run_mock.assert_not_called()
+
+    def test_process_inbound_routed_author_bd_create_failure_acks_and_stops(self) -> None:
+        common.set_chat_binding(
+            common.load_config(),
+            "room",
+            "22",
+            ["sky"],
+            guild_id="1",
+            dispatch_authors=["9001"],
+            dispatch_workdir="/repo/sysadmin",
+        )
+        common.save_bot_token("bot-token")
+        message = {
+            "id": "603",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "<@999> do the thing",
+            "mentions": [{"id": "999"}],
+            "author": {"id": "9001", "username": "austin"},
+        }
+
+        def fake_run(argv, cwd=None, env=None, timeout=None, capture_output=None, text=None):
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="db locked\nsome traceback junk")
+
+        with mock.patch.object(gateway_service.subprocess, "run", side_effect=fake_run) as run_mock, mock.patch.object(
+            common, "post_channel_message"
+        ) as post_channel_message, mock.patch.object(common, "discord_api_request", return_value=[]):
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "failed_dispatch")
+        run_mock.assert_called_once()
+        post_channel_message.assert_called_once()
+        self.assertEqual(post_channel_message.call_args.args[1], "could not file a bead: db locked")
+
+    def test_process_inbound_routed_author_dispatch_tool_failure_still_acks_filed(self) -> None:
+        common.set_chat_binding(
+            common.load_config(),
+            "room",
+            "22",
+            ["sky"],
+            guild_id="1",
+            dispatch_authors=["9001"],
+            dispatch_workdir="/repo/sysadmin",
+        )
+        common.save_bot_token("bot-token")
+        message = {
+            "id": "604",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "<@999> do the thing",
+            "mentions": [{"id": "999"}],
+            "author": {"id": "9001", "username": "austin"},
+        }
+
+        def fake_run(argv, cwd=None, env=None, timeout=None, capture_output=None, text=None):
+            if argv[:2] == ["bd", "create"]:
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"id": "sys-xyz"}), stderr="")
+            if argv[:2] == ["bd", "tag"]:
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if argv[:2] == ["./bin/tools", "dispatch"]:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="refused: bead is not claimable\nmore output"
+                )
+            raise AssertionError(f"unexpected subprocess call: {argv}")
+
+        with mock.patch.object(gateway_service.subprocess, "run", side_effect=fake_run), mock.patch.object(
+            common, "post_channel_message"
+        ) as post_channel_message, mock.patch.object(common, "discord_api_request", return_value=[]):
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "dispatched")
+        self.assertEqual(outcome["bead_id"], "sys-xyz")
+        post_channel_message.assert_called_once()
+        self.assertEqual(
+            post_channel_message.call_args.args[1],
+            "filed sys-xyz; dispatch failed: refused: bead is not claimable",
+        )
 
     def test_process_inbound_ambient_room_message_routes_targeted_alias_without_bot_mention(self) -> None:
         common.set_chat_binding(

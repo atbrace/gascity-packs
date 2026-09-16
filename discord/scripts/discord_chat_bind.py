@@ -52,6 +52,19 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--max-peer-triggered-publishes-per-root", type=int, default=None)
     parser.add_argument("--max-total-peer-deliveries-per-root", type=int, default=None)
     parser.add_argument("--max-peer-triggered-publishes-per-session-per-minute", type=int, default=None)
+    parser.add_argument(
+        "--dispatch-author",
+        action="append",
+        default=None,
+        dest="dispatch_authors",
+        metavar="USER_ID",
+        help="Discord user id trusted to have mentions routed to bead dispatch instead of a session (repeatable)",
+    )
+    parser.add_argument(
+        "--dispatch-workdir",
+        default=None,
+        help="Local checkout the gateway runs bd/dispatch from for --dispatch-author routing",
+    )
     parser.add_argument("conversation_id", help="Discord DM, channel, or thread id")
     parser.add_argument("session_name", nargs="+", help="Gas City session name(s)")
     args = parser.parse_args(argv)
@@ -160,6 +173,8 @@ def main(argv: list[str]) -> int:
             app_name=app_name,
             policy=room_policy or None,
             channel_metadata=channel_metadata,
+            dispatch_authors=args.dispatch_authors,
+            dispatch_workdir=args.dispatch_workdir,
         )
     except (ValueError, common.DiscordAPIError) as exc:
         raise SystemExit(str(exc)) from exc

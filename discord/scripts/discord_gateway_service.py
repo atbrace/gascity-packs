@@ -15,6 +15,7 @@ import socket
 import socketserver
 import ssl
 import struct
+import subprocess
 import threading
 import time
 import traceback
@@ -408,6 +409,31 @@ def cap_context_bytes(context: dict[str, Any], max_bytes: int = 4000) -> dict[st
         messages.pop(drop_index)
         capped = {**context, "recent_messages": messages}
     return capped
+
+
+def build_mentioned_context(
+    binding: dict[str, Any],
+    message: dict[str, Any],
+    channel_info: dict[str, Any],
+    channel_id: str,
+    normalized_app_name: str,
+) -> dict[str, Any]:
+    channel_type_for_context = channel_info.get("type", channel_info.get("channel_type"))
+    if channel_type_for_context is None:
+        channel_type_for_context = binding.get("channel_type", 0)
+    try:
+        channel_type_for_context = int(channel_type_for_context or 0)
+    except (TypeError, ValueError):
+        channel_type_for_context = 0
+    context_bot_token = common.load_bot_token(normalized_app_name)
+    recent_messages = fetch_recent_context(
+        channel_id,
+        str(message.get("id", "")).strip(),
+        context_bot_token,
+        channel_type_for_context,
+    )
+    context_channel_name = str(channel_info.get("name", "")).strip() or str(binding.get("channel_name", "")).strip()
+    return cap_context_bytes({"channel_name": context_channel_name, "recent_messages": recent_messages})
 
 
 def recover_message_for_routing(
@@ -924,6 +950,159 @@ def build_human_envelope(
         "</discord-event>",
     ])
     return "\n".join(lines)
+
+
+DISPATCH_TITLE_MAX_CHARS = 80
+DISPATCH_ACK_REASON_MAX_CHARS = 200
+DISPATCH_BD_CREATE_TIMEOUT_SECONDS = 30
+DISPATCH_BD_TAG_TIMEOUT_SECONDS = 30
+DISPATCH_TOOL_TIMEOUT_SECONDS = 60
+
+
+def dispatch_subprocess_env() -> dict[str, str]:
+    # bd resolves its store by cwd walk-up; a pinned BEADS_DIR/BEADS_DB in the
+    # gateway's own environment would silently repoint bd away from the sys- store.
+    return {key: value for key, value in os.environ.items() if key not in ("BEADS_DIR", "BEADS_DB")}
+
+
+def dispatch_bead_title(body: str, from_display: str) -> str:
+    first_line = next((line.strip() for line in str(body).splitlines() if line.strip()), "")
+    if not first_line:
+        first_line = f"Discord request from {from_display}"
+    if len(first_line) > DISPATCH_TITLE_MAX_CHARS:
+        first_line = first_line[:DISPATCH_TITLE_MAX_CHARS].rstrip()
+    return first_line
+
+
+def dispatch_short_reason(text: Any, limit: int = DISPATCH_ACK_REASON_MAX_CHARS) -> str:
+    first_line = next((line.strip() for line in str(text).splitlines() if line.strip()), "")
+    if not first_line:
+        return "unknown error"
+    if len(first_line) > limit:
+        first_line = first_line[:limit].rstrip() + "..."
+    return first_line
+
+
+def dispatch_to_bead(
+    *,
+    binding: dict[str, Any],
+    message: dict[str, Any],
+    body: str,
+    channel_id: str,
+    envelope: str,
+    ingress_id: str,
+    base_receipt: dict[str, Any],
+    normalized_app_name: str,
+) -> dict[str, Any]:
+    message_id = str(message.get("id", "")).strip()
+    bot_token = common.load_bot_token(normalized_app_name)
+    workdir = str(binding.get("dispatch_workdir", "")).strip()
+    binding_id = str(binding.get("id", "")).strip()
+
+    def ack(text: str) -> None:
+        if not bot_token:
+            return
+        try:
+            common.post_channel_message(channel_id, text, reply_to_message_id=message_id, bot_token=bot_token)
+        except Exception:
+            pass  # a failed ack must never raise out of the worker
+
+    def failed(reason: str) -> dict[str, Any]:
+        receipt = persist_ingress_receipt(
+            {
+                **base_receipt,
+                "binding_id": binding_id,
+                "status": "failed_dispatch",
+                "reason": reason,
+                "targets": [],
+            }
+        )
+        return {"status": "failed_dispatch", "ingress_id": ingress_id, "receipt": receipt}
+
+    if not workdir:
+        ack("could not file a bead: dispatch_workdir is not configured")
+        return failed("dispatch_workdir_not_configured")
+
+    env = dispatch_subprocess_env()
+    title = dispatch_bead_title(body, display_name_from_message(message))
+    try:
+        create_result = subprocess.run(
+            ["bd", "create", "--title", title, "--description", envelope, "-t", "task", "-p", "2", "--json"],
+            cwd=workdir,
+            env=env,
+            timeout=DISPATCH_BD_CREATE_TIMEOUT_SECONDS,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        reason = dispatch_short_reason(exc)
+        ack(f"could not file a bead: {reason}")
+        return failed(f"bd_create_error: {reason}")
+
+    if create_result.returncode != 0:
+        reason = dispatch_short_reason(create_result.stderr or create_result.stdout)
+        ack(f"could not file a bead: {reason}")
+        return failed(f"bd_create_failed: {reason}")
+
+    bead_id = ""
+    try:
+        created = json.loads(create_result.stdout)
+        if isinstance(created, list):
+            created = created[0] if created else {}
+        if isinstance(created, dict):
+            bead_id = str(created.get("id") or created.get("bead_id") or "").strip()
+    except (json.JSONDecodeError, IndexError, AttributeError):
+        bead_id = ""
+
+    if not bead_id:
+        ack("could not file a bead: bd create returned no bead id")
+        return failed("bd_create_no_id")
+
+    try:
+        subprocess.run(
+            ["bd", "tag", bead_id, "discord-request"],
+            cwd=workdir,
+            env=env,
+            timeout=DISPATCH_BD_TAG_TIMEOUT_SECONDS,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        pass  # tagging is best-effort; the bead is already filed
+
+    try:
+        dispatch_result = subprocess.run(
+            ["./bin/tools", "dispatch", bead_id],
+            cwd=workdir,
+            env=env,
+            timeout=DISPATCH_TOOL_TIMEOUT_SECONDS,
+            capture_output=True,
+            text=True,
+        )
+        dispatch_ok = dispatch_result.returncode == 0
+        dispatch_reason = (
+            "" if dispatch_ok else dispatch_short_reason(dispatch_result.stderr or dispatch_result.stdout)
+        )
+    except Exception as exc:
+        dispatch_ok = False
+        dispatch_reason = dispatch_short_reason(exc)
+
+    if dispatch_ok:
+        ack(f"filed {bead_id}, dispatched")
+    else:
+        ack(f"filed {bead_id}; dispatch failed: {dispatch_reason}")
+
+    receipt = persist_ingress_receipt(
+        {
+            **base_receipt,
+            "binding_id": binding_id,
+            "status": "dispatched",
+            "reason": "" if dispatch_ok else f"dispatch_failed: {dispatch_reason}",
+            "dispatch_bead_id": bead_id,
+            "targets": [],
+        }
+    )
+    return {"status": "dispatched", "ingress_id": ingress_id, "receipt": receipt, "bead_id": bead_id}
 
 
 def build_room_launch_envelope(
@@ -2145,6 +2324,33 @@ def process_inbound_message(
             return {"status": "rejected_unbound", "ingress_id": ingress_id, "receipt": receipt}
 
         body = preloaded_body if preloaded_body is not None else strip_bot_mentions(str(message.get("content", "")), bot_user_id)
+        dispatch_authors = set(binding.get("dispatch_authors") or [])
+        from_user_id = str(author.get("id", "")).strip()
+        if mentioned_bot and dispatch_authors and from_user_id and from_user_id in dispatch_authors:
+            mentioned_aliases_for_dispatch = (
+                preloaded_aliases if preloaded_aliases is not None else extract_alias_mentions(body)
+            )
+            context = build_mentioned_context(binding, message, channel_info, channel_id, normalized_app_name)
+            envelope = build_human_envelope(
+                binding=binding,
+                message=message,
+                channel_info=channel_info,
+                body=body,
+                mentioned_aliases=mentioned_aliases_for_dispatch,
+                delivery="dispatch",
+                ingress_id=ingress_id,
+                context=context,
+            )
+            return dispatch_to_bead(
+                binding=binding,
+                message=message,
+                body=body,
+                channel_id=channel_id,
+                envelope=envelope,
+                ingress_id=ingress_id,
+                base_receipt=base_receipt,
+                normalized_app_name=normalized_app_name,
+            )
         if not body:
             receipt = persist_ingress_receipt(
                 {
@@ -2206,24 +2412,7 @@ def process_inbound_message(
 
         context: dict[str, Any] | None = None
         if mentioned_bot:
-            channel_type_for_context = channel_info.get("type", channel_info.get("channel_type"))
-            if channel_type_for_context is None:
-                channel_type_for_context = binding.get("channel_type", 0)
-            try:
-                channel_type_for_context = int(channel_type_for_context or 0)
-            except (TypeError, ValueError):
-                channel_type_for_context = 0
-            context_bot_token = common.load_bot_token(normalized_app_name)
-            recent_messages = fetch_recent_context(
-                channel_id,
-                str(message.get("id", "")).strip(),
-                context_bot_token,
-                channel_type_for_context,
-            )
-            context_channel_name = (
-                str(channel_info.get("name", "")).strip() or str(binding.get("channel_name", "")).strip()
-            )
-            context = cap_context_bytes({"channel_name": context_channel_name, "recent_messages": recent_messages})
+            context = build_mentioned_context(binding, message, channel_info, channel_id, normalized_app_name)
 
         envelope = build_human_envelope(
             binding=binding,

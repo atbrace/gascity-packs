@@ -311,6 +311,20 @@ def dedupe_session_names(values: list[str]) -> list[str]:
     return session_names
 
 
+def normalize_dispatch_authors(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    seen: set[str] = set()
+    authors: list[str] = []
+    for value in values:
+        normalized = str(value).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        authors.append(normalized)
+    return authors
+
+
 def room_launch_surface_id(conversation_id: str) -> str:
     return f"launch-room:{str(conversation_id).strip()}"
 
@@ -423,6 +437,12 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
                     normalized_bindings[binding_id].update(channel_metadata)
                 if kind == "room":
                     normalized_bindings[binding_id]["policy"] = normalize_room_peer_policy(value.get("policy"))
+                dispatch_authors = normalize_dispatch_authors(value.get("dispatch_authors"))
+                if dispatch_authors:
+                    normalized_bindings[binding_id]["dispatch_authors"] = dispatch_authors
+                dispatch_workdir = str(value.get("dispatch_workdir", "")).strip()
+                if dispatch_workdir:
+                    normalized_bindings[binding_id]["dispatch_workdir"] = dispatch_workdir
         launchers = chat.get("launchers")
         if isinstance(launchers, dict):
             for key, value in launchers.items():
@@ -819,6 +839,8 @@ def set_chat_binding(
     app_name: str = "",
     policy: dict[str, Any] | None = None,
     channel_metadata: dict[str, Any] | None = None,
+    dispatch_authors: list[str] | None = None,
+    dispatch_workdir: str | None = None,
 ) -> dict[str, Any]:
     with advisory_lock(config_mutation_lock_path()):
         current = load_config() if os.path.exists(config_path()) else normalize_config(config)
@@ -831,6 +853,8 @@ def set_chat_binding(
             app_name=app_name,
             policy=policy,
             channel_metadata=channel_metadata,
+            dispatch_authors=dispatch_authors,
+            dispatch_workdir=dispatch_workdir,
         )
 
 
@@ -844,6 +868,8 @@ def _set_chat_binding_locked(
     app_name: str = "",
     policy: dict[str, Any] | None = None,
     channel_metadata: dict[str, Any] | None = None,
+    dispatch_authors: list[str] | None = None,
+    dispatch_workdir: str | None = None,
 ) -> dict[str, Any]:
     normalized_kind = str(kind).strip().lower()
     if normalized_kind not in {"dm", "room", "guild"}:
@@ -865,6 +891,14 @@ def _set_chat_binding_locked(
     existing = resolve_chat_binding(cfg, binding_id) or {}
     raw_room_policy = copy.deepcopy(existing.get("policy")) if isinstance(existing.get("policy"), dict) else {}
     raw_channel_metadata = normalize_binding_channel_metadata(existing)
+    effective_dispatch_authors = (
+        normalize_dispatch_authors(dispatch_authors)
+        if dispatch_authors is not None
+        else normalize_dispatch_authors(existing.get("dispatch_authors"))
+    )
+    effective_dispatch_workdir = (
+        str(dispatch_workdir).strip() if dispatch_workdir is not None else str(existing.get("dispatch_workdir", "")).strip()
+    )
     if isinstance(channel_metadata, dict):
         raw_channel_metadata.update(normalize_binding_channel_metadata(channel_metadata))
     if isinstance(policy, dict):
@@ -894,6 +928,10 @@ def _set_chat_binding_locked(
         if raw_channel_metadata:
             binding.update(raw_channel_metadata)
         binding["policy"] = room_policy
+    if effective_dispatch_authors:
+        binding["dispatch_authors"] = effective_dispatch_authors
+    if effective_dispatch_workdir:
+        binding["dispatch_workdir"] = effective_dispatch_workdir
     cfg["chat"]["bindings"][binding_id] = binding
     return save_config(cfg)
 
