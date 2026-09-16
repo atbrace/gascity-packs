@@ -1981,12 +1981,17 @@ def process_inbound_message(
             roles = (message.get("member") or {}).get("roles") or []
             role_ids = [str(role_id).strip() for role_id in roles if str(role_id).strip()]
             policy_route = launcher or binding or {}
-            policy_channel_id = (
-                str(policy_route.get("thread_parent_id", "")).strip()
-                or str(channel_info.get("parent_id", "")).strip()
-                or str(policy_route.get("conversation_id", "")).strip()
-                or channel_id
-            )
+            if str(policy_route.get("kind", "")).strip() == "guild":
+                # A guild binding's conversation_id is the guild id, not a channel id —
+                # the channel policy must always be checked against the message's own channel.
+                policy_channel_id = channel_id
+            else:
+                policy_channel_id = (
+                    str(policy_route.get("thread_parent_id", "")).strip()
+                    or str(channel_info.get("parent_id", "")).strip()
+                    or str(policy_route.get("conversation_id", "")).strip()
+                    or channel_id
+                )
             policy_rejection = common.policy_reason(
                 config,
                 guild_id,

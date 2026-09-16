@@ -1788,6 +1788,89 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         self.assertEqual(outcome["reason"], "not_mentioned")
         deliver_session_message.assert_not_called()
 
+    def test_process_inbound_guild_binding_falls_back_when_channel_info_lookup_404s(self) -> None:
+        common.set_chat_binding(common.load_config(), "guild", "1", ["sky"])
+        common.save_bot_token("bot-token")
+        message = {
+            "id": "511",
+            "guild_id": "1",
+            "channel_id": "222",
+            "content": "<@999> what's up",
+            "mentions": [{"id": "999"}],
+            "author": {"id": "u-8", "username": "alice"},
+        }
+
+        with mock.patch.object(
+            common, "discord_api_request", side_effect=common.DiscordAPIError("GET channel failed", status_code=404)
+        ), mock.patch.object(
+            common,
+            "session_index_by_name",
+            return_value={"sky": {"session_name": "sky", "state": "active"}},
+        ), mock.patch.object(common, "deliver_session_message", return_value={"status": "accepted"}) as deliver_session_message:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "delivered")
+        deliver_session_message.assert_called_once()
+        self.assertEqual(deliver_session_message.call_args.args[0], "sky")
+
+    def test_process_inbound_guild_binding_checks_channel_policy_against_message_channel(self) -> None:
+        config = common.import_app_config(
+            common.load_config(),
+            {
+                "application_id": "999",
+                "public_key": "ab" * 32,
+                "guild_allowlist": ["1"],
+                "channel_allowlist": ["22"],
+            },
+        )
+        common.set_chat_binding(config, "guild", "1", ["sky"])
+        message = {
+            "id": "512",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "<@999> what's up",
+            "mentions": [{"id": "999"}],
+            "author": {"id": "u-9", "username": "alice"},
+        }
+
+        with mock.patch.object(
+            common,
+            "session_index_by_name",
+            return_value={"sky": {"session_name": "sky", "state": "active"}},
+        ), mock.patch.object(common, "deliver_session_message", return_value={"status": "accepted"}) as deliver_session_message:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "delivered")
+        deliver_session_message.assert_called_once()
+        self.assertEqual(deliver_session_message.call_args.args[0], "sky")
+
+    def test_process_inbound_guild_binding_rejects_when_message_channel_outside_allowlist(self) -> None:
+        config = common.import_app_config(
+            common.load_config(),
+            {
+                "application_id": "999",
+                "public_key": "ab" * 32,
+                "guild_allowlist": ["1"],
+                "channel_allowlist": ["other-channel"],
+            },
+        )
+        common.set_chat_binding(config, "guild", "1", ["sky"])
+        message = {
+            "id": "513",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "<@999> what's up",
+            "mentions": [{"id": "999"}],
+            "author": {"id": "u-10", "username": "alice"},
+        }
+
+        with mock.patch.object(common, "deliver_session_message") as deliver_session_message:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "rejected_policy")
+        self.assertEqual(outcome["reason"], "channel_not_allowed")
+        deliver_session_message.assert_not_called()
+
     def test_process_inbound_ambient_room_message_routes_targeted_alias_without_bot_mention(self) -> None:
         common.set_chat_binding(
             common.load_config(),
