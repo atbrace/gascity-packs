@@ -22,7 +22,7 @@ def _optional_bool(enabled: bool, disabled: bool, *, enable_flag: str, disable_f
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Bind a Discord conversation to one or more named sessions")
-    parser.add_argument("--kind", required=True, choices=("dm", "room"), help="Binding kind")
+    parser.add_argument("--kind", required=True, choices=("dm", "room", "guild"), help="Binding kind")
     parser.add_argument("--app", default="", help="Optional named app identity")
     parser.add_argument("--guild-id", default="", help="Discord guild id")
     parser.add_argument("--enable-ambient-read", action="store_true", help="Accept unmentioned messages in a bound room")
@@ -104,7 +104,7 @@ def main(argv: list[str]) -> int:
         app_name = common.validate_app_name(args.app)
         loaded_config = common.load_config()
         channel_metadata: dict[str, Any] | None = None
-        effective_guild_id = str(args.guild_id).strip()
+        effective_guild_id = str(args.guild_id).strip() or (args.conversation_id if args.kind == "guild" else "")
         if app_name:
             common.resolve_app_config(loaded_config, app_name)
         if args.kind == "room":

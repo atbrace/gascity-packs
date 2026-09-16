@@ -620,6 +620,11 @@ def resolve_binding(
         binding.update(common.normalize_binding_channel_metadata(looked_up_channel_info))
         persist_binding_channel_metadata(binding)
         return binding, binding_channel_info(binding)
+    guild_binding = common.resolve_chat_binding(
+        config, common.chat_binding_id("guild", guild_id, normalized_app_name)
+    )
+    if guild_binding:
+        return guild_binding, channel_info
     bot_token = common.load_bot_token(normalized_app_name)
     if not bot_token:
         return None, channel_info

@@ -249,6 +249,7 @@ Inbound behavior in v0:
 - single-session ambient-read bindings may opt into untargeted delivery with `--allow-untargeted-ambient-delivery`; that sticky room mode delivers all visible messages to the one bound agent, even when the body includes a non-exact shorthand such as `@randy`
 - thread messages inherit the parent room binding when the thread itself is not bound
 - inherited thread routing still requires a bot mention unless the thread itself is bound with ambient read
+- a `guild:<guild_id>` binding (`gc discord bind --kind guild <guild_id> <session_name>`, local fork only) is a last-resort fallback: any mentioned message in that guild with no room binding (and no bound thread parent) routes to it, so new channels need no per-channel bind; it is always mention-only and never grants ambient read, and a specific room or thread-parent binding still wins when one exists
 - ambient-read rooms stay targeted-only even when the bot is mentioned, unless the binding explicitly allows untargeted ambient delivery for its one bound session
 - launcher rooms and ambient-read rooms depend on Discord `Message Content Intent` because they consume unmentioned guild text
 - `@sky` inside the message targets that session name exactly

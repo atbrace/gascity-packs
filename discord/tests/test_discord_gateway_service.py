@@ -1721,6 +1721,49 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         self.assertEqual(outcome["reason"], "not_mentioned")
         deliver_session_message.assert_not_called()
 
+    def test_process_inbound_mentioned_message_falls_back_to_guild_binding(self) -> None:
+        common.set_chat_binding(common.load_config(), "guild", "1", ["sky"])
+        message = {
+            "id": "509",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "<@999> what's up",
+            "mentions": [{"id": "999"}],
+            "author": {"id": "u-6", "username": "alice"},
+        }
+
+        with mock.patch.object(
+            common,
+            "session_index_by_name",
+            return_value={"sky": {"session_name": "sky", "state": "active"}},
+        ), mock.patch.object(common, "deliver_session_message", return_value={"status": "accepted"}) as deliver_session_message:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "delivered")
+        deliver_session_message.assert_called_once()
+        self.assertEqual(deliver_session_message.call_args.args[0], "sky")
+        receipt = common.load_chat_ingress("in-509")
+        assert receipt is not None
+        self.assertEqual(receipt["status"], "delivered")
+
+    def test_process_inbound_unmentioned_message_ignores_guild_binding(self) -> None:
+        common.set_chat_binding(common.load_config(), "guild", "1", ["sky"])
+        message = {
+            "id": "510",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "just chatting here",
+            "mentions": [],
+            "author": {"id": "u-7", "username": "alice"},
+        }
+
+        with mock.patch.object(common, "deliver_session_message") as deliver_session_message:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "ignored")
+        self.assertEqual(outcome["reason"], "not_mentioned")
+        deliver_session_message.assert_not_called()
+
     def test_process_inbound_ambient_room_message_routes_targeted_alias_without_bot_mention(self) -> None:
         common.set_chat_binding(
             common.load_config(),

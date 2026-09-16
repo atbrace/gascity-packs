@@ -393,7 +393,7 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
                     continue
                 kind = str(value.get("kind", "")).strip().lower()
                 conversation_id = str(value.get("conversation_id", "")).strip()
-                if kind not in {"dm", "room"} or not conversation_id:
+                if kind not in {"dm", "room", "guild"} or not conversation_id:
                     continue
                 session_names = value.get("session_names")
                 if not isinstance(session_names, list):
@@ -843,8 +843,8 @@ def _set_chat_binding_locked(
     channel_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_kind = str(kind).strip().lower()
-    if normalized_kind not in {"dm", "room"}:
-        raise ValueError("kind must be dm or room")
+    if normalized_kind not in {"dm", "room", "guild"}:
+        raise ValueError("kind must be dm, room, or guild")
     normalized_conversation = str(conversation_id).strip()
     if not normalized_conversation:
         raise ValueError("conversation_id is required")
