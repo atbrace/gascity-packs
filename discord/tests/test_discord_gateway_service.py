@@ -2016,7 +2016,7 @@ class DiscordGatewayServiceTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"id": "sys-abc123"}), stderr="")
             if argv[:2] == ["bd", "tag"]:
                 return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-            if argv[:2] == ["./bin/tools", "dispatch"]:
+            if argv[:2] == ["gc", "sling"]:
                 return subprocess.CompletedProcess(argv, 0, stdout='{"admitted": true}', stderr="")
             raise AssertionError(f"unexpected subprocess call: {argv}")
 
@@ -2027,11 +2027,14 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         ) as deliver_session_message, mock.patch.object(common, "discord_api_request", return_value=[]):
             outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
 
+        # No recognized seam prefix ("restart the pihole ...") falls back to the default
+        # seam, recon, which routes through gc sling ... --on homeops-recon --nudge.
         self.assertEqual(outcome["status"], "dispatched")
+        self.assertEqual(outcome["seam"], "recon")
         self.assertEqual(outcome["bead_id"], "sys-abc123")
-        self.assertEqual(run_mock.call_count, 3)
+        self.assertEqual(run_mock.call_count, 4)
         post_channel_message.assert_called_once()
-        self.assertEqual(post_channel_message.call_args.args[1], "filed sys-abc123, dispatched")
+        self.assertEqual(post_channel_message.call_args.args[1], "filed sys-abc123 → recon")
         deliver_session_message.assert_not_called()
         create_call = run_mock.call_args_list[0]
         self.assertEqual(create_call.args[0][:2], ["bd", "create"])
@@ -2040,14 +2043,18 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         self.assertIn("untrusted_body_json:", description)
         self.assertIn("untrusted_context_json:", description)
         self.assertIn("from_user_id: 9001", description)
-        tag_call = run_mock.call_args_list[1]
-        self.assertEqual(tag_call.args[0], ["bd", "tag", "sys-abc123", "discord-request"])
-        dispatch_call = run_mock.call_args_list[2]
-        self.assertEqual(dispatch_call.args[0], ["./bin/tools", "dispatch", "sys-abc123"])
+        tag_calls = [call.args[0] for call in run_mock.call_args_list[1:3]]
+        self.assertEqual(tag_calls, [["bd", "tag", "sys-abc123", "discord-request"], ["bd", "tag", "sys-abc123", "seam:recon"]])
+        dispatch_call = run_mock.call_args_list[3]
+        self.assertEqual(
+            dispatch_call.args[0],
+            ["gc", "sling", "sysadmin/homeops.homeops-luna", "sys-abc123", "--on", "homeops-recon", "--nudge"],
+        )
         receipt = common.load_chat_ingress("in-601")
         assert receipt is not None
         self.assertEqual(receipt["status"], "dispatched")
         self.assertEqual(receipt["dispatch_bead_id"], "sys-abc123")
+        self.assertEqual(receipt["dispatch_seam"], "recon")
 
     def test_process_inbound_non_routed_author_on_dispatch_binding_delivers_normally(self) -> None:
         common.set_chat_binding(
@@ -2129,7 +2136,7 @@ class DiscordGatewayServiceTests(unittest.TestCase):
             "id": "604",
             "guild_id": "1",
             "channel_id": "22",
-            "content": "<@999> do the thing",
+            "content": "<@999> fix: do the thing",
             "mentions": [{"id": "999"}],
             "author": {"id": "9001", "username": "austin"},
         }
@@ -2145,18 +2152,88 @@ class DiscordGatewayServiceTests(unittest.TestCase):
                 )
             raise AssertionError(f"unexpected subprocess call: {argv}")
 
-        with mock.patch.object(gateway_service.subprocess, "run", side_effect=fake_run), mock.patch.object(
+        with mock.patch.object(gateway_service.subprocess, "run", side_effect=fake_run) as run_mock, mock.patch.object(
             common, "post_channel_message"
         ) as post_channel_message, mock.patch.object(common, "discord_api_request", return_value=[]):
             outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
 
         self.assertEqual(outcome["status"], "dispatched")
+        self.assertEqual(outcome["seam"], "fix")
         self.assertEqual(outcome["bead_id"], "sys-xyz")
         post_channel_message.assert_called_once()
         self.assertEqual(
             post_channel_message.call_args.args[1],
-            "filed sys-xyz; dispatch failed: refused: bead is not claimable",
+            "filed sys-xyz; fix dispatch failed: refused: bead is not claimable",
         )
+        create_call = run_mock.call_args_list[0]
+        title = create_call.args[0][create_call.args[0].index("--title") + 1]
+        self.assertEqual(title, "do the thing")  # the "fix:" prefix is stripped from the title only
+        description = create_call.args[0][create_call.args[0].index("--description") + 1]
+        self.assertIn("fix: do the thing", description)  # the envelope/body keeps the original text
+        dispatch_call = run_mock.call_args_list[3]
+        self.assertEqual(dispatch_call.args[0], ["./bin/tools", "dispatch", "sys-xyz"])
+
+    def test_process_inbound_routed_author_ops_prefix_slings_to_mechanic(self) -> None:
+        common.set_chat_binding(
+            common.load_config(),
+            "room",
+            "22",
+            ["sky"],
+            guild_id="1",
+            dispatch_authors=["9001"],
+            dispatch_workdir="/repo/sysadmin",
+        )
+        common.save_bot_token("bot-token")
+        message = {
+            "id": "605",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "<@999> ops: restart the pihole exporter",
+            "mentions": [{"id": "999"}],
+            "author": {"id": "9001", "username": "austin"},
+        }
+
+        def fake_run(argv, cwd=None, env=None, timeout=None, capture_output=None, text=None):
+            if argv[:2] == ["bd", "create"]:
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"id": "sys-ops1"}), stderr="")
+            if argv[:2] == ["bd", "tag"]:
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if argv[:2] == ["gc", "sling"]:
+                return subprocess.CompletedProcess(argv, 0, stdout='{"admitted": true}', stderr="")
+            raise AssertionError(f"unexpected subprocess call: {argv}")
+
+        with mock.patch.object(gateway_service.subprocess, "run", side_effect=fake_run) as run_mock, mock.patch.object(
+            common, "post_channel_message"
+        ) as post_channel_message, mock.patch.object(common, "discord_api_request", return_value=[]):
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "dispatched")
+        self.assertEqual(outcome["seam"], "ops")
+        create_call = run_mock.call_args_list[0]
+        self.assertEqual(
+            create_call.args[0][create_call.args[0].index("--title") + 1], "restart the pihole exporter"
+        )
+        dispatch_call = run_mock.call_args_list[3]
+        self.assertEqual(
+            dispatch_call.args[0],
+            ["gc", "sling", "sysadmin/homeops.homeops-mechanic", "sys-ops1", "--nudge"],
+        )
+        self.assertEqual(post_channel_message.call_args.args[1], "filed sys-ops1 → ops")
+
+    def test_parse_dispatch_seam_prefix_rules(self) -> None:
+        # Case-insensitive, and either ":" or a single whitespace char after the bare word
+        # counts as the separator; the word must match exactly ("fixing" does not match "fix").
+        self.assertEqual(gateway_service.parse_dispatch_seam("Fix: do the thing"), ("fix", "do the thing"))
+        self.assertEqual(gateway_service.parse_dispatch_seam("FIX do the thing"), ("fix", "do the thing"))
+        # "fix -" has no colon, so the rule consumes only the bare word plus its one
+        # following whitespace char; the "-" is not a recognized separator and is kept.
+        self.assertEqual(gateway_service.parse_dispatch_seam("fix - do the thing"), ("fix", "- do the thing"))
+        self.assertEqual(gateway_service.parse_dispatch_seam("recon: check the logs"), ("recon", "check the logs"))
+        self.assertEqual(gateway_service.parse_dispatch_seam("ops: restart it"), ("ops", "restart it"))
+        # No recognized prefix, or a word that merely starts with one, falls back to the default seam
+        # with the body returned untouched.
+        self.assertEqual(gateway_service.parse_dispatch_seam("just do it"), ("recon", "just do it"))
+        self.assertEqual(gateway_service.parse_dispatch_seam("fixing this now"), ("recon", "fixing this now"))
 
     def test_process_inbound_ambient_room_message_routes_targeted_alias_without_bot_mention(self) -> None:
         common.set_chat_binding(

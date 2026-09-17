@@ -958,11 +958,43 @@ DISPATCH_BD_CREATE_TIMEOUT_SECONDS = 30
 DISPATCH_BD_TAG_TIMEOUT_SECONDS = 30
 DISPATCH_TOOL_TIMEOUT_SECONDS = 60
 
+# This rig's three dispatch seams (sys-r61avt, Austin's decision on the bead). A leading
+# "fix"/"recon"/"ops" word (":" or whitespace right after) in the message routes here; no
+# match falls back to DISPATCH_DEFAULT_SEAM. Hardcoded on purpose — these are this rig's
+# seams, not a pluggable config surface.
+DISPATCH_SEAM_ARGV_TEMPLATES: dict[str, list[str]] = {
+    "fix": ["./bin/tools", "dispatch", "{bead_id}"],
+    "recon": ["gc", "sling", "sysadmin/homeops.homeops-luna", "{bead_id}", "--on", "homeops-recon", "--nudge"],
+    "ops": ["gc", "sling", "sysadmin/homeops.homeops-mechanic", "{bead_id}", "--nudge"],
+}
+DISPATCH_DEFAULT_SEAM = "recon"
+DISPATCH_SEAM_PREFIX_PATTERN = re.compile(
+    "^(" + "|".join(DISPATCH_SEAM_ARGV_TEMPLATES) + r")(:|\s)", re.IGNORECASE
+)
+
 
 def dispatch_subprocess_env() -> dict[str, str]:
     # bd resolves its store by cwd walk-up; a pinned BEADS_DIR/BEADS_DB in the
     # gateway's own environment would silently repoint bd away from the sys- store.
     return {key: value for key, value in os.environ.items() if key not in ("BEADS_DIR", "BEADS_DB")}
+
+
+def parse_dispatch_seam(body: str) -> tuple[str, str]:
+    # A leading "fix"/"recon"/"ops" word must be followed immediately by ":" or a single
+    # whitespace character to count ("fix:", "fix do this", "Fix: do this" all match;
+    # "fixing this" does not, since "i" is neither). Only that word plus its one separator
+    # char is consumed — any further leading whitespace is trimmed too, but nothing else
+    # (e.g. "fix - do this" keeps the leading "-" in the returned text). The match only
+    # affects the returned title-source text; the caller's own envelope/body is untouched.
+    match = DISPATCH_SEAM_PREFIX_PATTERN.match(str(body))
+    if not match:
+        return DISPATCH_DEFAULT_SEAM, body
+    return match.group(1).lower(), str(body)[match.end():].lstrip()
+
+
+def dispatch_seam_argv(seam: str, bead_id: str) -> list[str]:
+    template = DISPATCH_SEAM_ARGV_TEMPLATES[seam]
+    return [part.format(bead_id=bead_id) for part in template]
 
 
 def dispatch_bead_title(body: str, from_display: str) -> str:
@@ -987,7 +1019,8 @@ def dispatch_to_bead(
     *,
     binding: dict[str, Any],
     message: dict[str, Any],
-    body: str,
+    title: str,
+    seam: str,
     channel_id: str,
     envelope: str,
     ingress_id: str,
@@ -1024,7 +1057,6 @@ def dispatch_to_bead(
         return failed("dispatch_workdir_not_configured")
 
     env = dispatch_subprocess_env()
-    title = dispatch_bead_title(body, display_name_from_message(message))
     try:
         create_result = subprocess.run(
             ["bd", "create", "--title", title, "--description", envelope, "-t", "task", "-p", "2", "--json"],
@@ -1058,21 +1090,22 @@ def dispatch_to_bead(
         ack("could not file a bead: bd create returned no bead id")
         return failed("bd_create_no_id")
 
-    try:
-        subprocess.run(
-            ["bd", "tag", bead_id, "discord-request"],
-            cwd=workdir,
-            env=env,
-            timeout=DISPATCH_BD_TAG_TIMEOUT_SECONDS,
-            capture_output=True,
-            text=True,
-        )
-    except Exception:
-        pass  # tagging is best-effort; the bead is already filed
+    for label in ("discord-request", f"seam:{seam}"):
+        try:
+            subprocess.run(
+                ["bd", "tag", bead_id, label],
+                cwd=workdir,
+                env=env,
+                timeout=DISPATCH_BD_TAG_TIMEOUT_SECONDS,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            pass  # tagging is best-effort; the bead is already filed
 
     try:
         dispatch_result = subprocess.run(
-            ["./bin/tools", "dispatch", bead_id],
+            dispatch_seam_argv(seam, bead_id),
             cwd=workdir,
             env=env,
             timeout=DISPATCH_TOOL_TIMEOUT_SECONDS,
@@ -1088,9 +1121,9 @@ def dispatch_to_bead(
         dispatch_reason = dispatch_short_reason(exc)
 
     if dispatch_ok:
-        ack(f"filed {bead_id}, dispatched")
+        ack(f"filed {bead_id} → {seam}")
     else:
-        ack(f"filed {bead_id}; dispatch failed: {dispatch_reason}")
+        ack(f"filed {bead_id}; {seam} dispatch failed: {dispatch_reason}")
 
     receipt = persist_ingress_receipt(
         {
@@ -1099,10 +1132,11 @@ def dispatch_to_bead(
             "status": "dispatched",
             "reason": "" if dispatch_ok else f"dispatch_failed: {dispatch_reason}",
             "dispatch_bead_id": bead_id,
+            "dispatch_seam": seam,
             "targets": [],
         }
     )
-    return {"status": "dispatched", "ingress_id": ingress_id, "receipt": receipt, "bead_id": bead_id}
+    return {"status": "dispatched", "ingress_id": ingress_id, "receipt": receipt, "bead_id": bead_id, "seam": seam}
 
 
 def build_room_launch_envelope(
@@ -2341,10 +2375,13 @@ def process_inbound_message(
                 ingress_id=ingress_id,
                 context=context,
             )
+            seam, title_source = parse_dispatch_seam(body)
+            title = dispatch_bead_title(title_source, display_name_from_message(message))
             return dispatch_to_bead(
                 binding=binding,
                 message=message,
-                body=body,
+                title=title,
+                seam=seam,
                 channel_id=channel_id,
                 envelope=envelope,
                 ingress_id=ingress_id,
