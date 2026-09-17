@@ -899,6 +899,8 @@ def _set_chat_binding_locked(
     effective_dispatch_workdir = (
         str(dispatch_workdir).strip() if dispatch_workdir is not None else str(existing.get("dispatch_workdir", "")).strip()
     )
+    if effective_dispatch_authors and not effective_dispatch_workdir:
+        raise ValueError("dispatch_workdir is required when dispatch_authors is set")
     if isinstance(channel_metadata, dict):
         raw_channel_metadata.update(normalize_binding_channel_metadata(channel_metadata))
     if isinstance(policy, dict):

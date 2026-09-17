@@ -997,6 +997,14 @@ def dispatch_seam_argv(seam: str, bead_id: str) -> list[str]:
     return [part.format(bead_id=bead_id) for part in template]
 
 
+def dispatch_safe_flag_value(value: str) -> str:
+    # A body starting with "-" (e.g. "--priority=0 pwn") must never be readable as a flag
+    # by bd's own (cobra) parser. --flag=<value> already binds regardless of a leading
+    # dash; prefixing a single space is a second line of defense if positional/value
+    # parsing ever changes.
+    return f" {value}" if value.startswith("-") else value
+
+
 def dispatch_bead_title(body: str, from_display: str) -> str:
     first_line = next((line.strip() for line in str(body).splitlines() if line.strip()), "")
     if not first_line:
@@ -1059,7 +1067,17 @@ def dispatch_to_bead(
     env = dispatch_subprocess_env()
     try:
         create_result = subprocess.run(
-            ["bd", "create", "--title", title, "--description", envelope, "-t", "task", "-p", "2", "--json"],
+            [
+                "bd",
+                "create",
+                f"--title={dispatch_safe_flag_value(title)}",
+                f"--description={dispatch_safe_flag_value(envelope)}",
+                "-t",
+                "task",
+                "-p",
+                "2",
+                "--json",
+            ],
             cwd=workdir,
             env=env,
             timeout=DISPATCH_BD_CREATE_TIMEOUT_SECONDS,

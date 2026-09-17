@@ -1878,6 +1878,11 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         context_line = next(line for line in envelope.splitlines() if line.startswith("untrusted_context_json:"))
         return json.loads(context_line[len("untrusted_context_json:"):].strip())
 
+    @staticmethod
+    def _bd_create_flag_value(argv: list[str], flag: str) -> str:
+        prefix = flag + "="
+        return next(arg[len(prefix):] for arg in argv if arg.startswith(prefix))
+
     def test_process_inbound_mentioned_thread_message_includes_recent_context(self) -> None:
         common.set_chat_binding(
             common.load_config(),
@@ -2038,8 +2043,8 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         deliver_session_message.assert_not_called()
         create_call = run_mock.call_args_list[0]
         self.assertEqual(create_call.args[0][:2], ["bd", "create"])
-        self.assertIn("restart the pihole exporter", create_call.args[0][create_call.args[0].index("--title") + 1])
-        description = create_call.args[0][create_call.args[0].index("--description") + 1]
+        self.assertIn("restart the pihole exporter", self._bd_create_flag_value(create_call.args[0], "--title"))
+        description = self._bd_create_flag_value(create_call.args[0], "--description")
         self.assertIn("untrusted_body_json:", description)
         self.assertIn("untrusted_context_json:", description)
         self.assertIn("from_user_id: 9001", description)
@@ -2087,6 +2092,87 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         self.assertEqual(outcome["status"], "delivered")
         deliver_session_message.assert_called_once()
         run_mock.assert_not_called()
+
+    def test_process_inbound_routed_author_missing_dispatch_workdir_acks_and_fails(self) -> None:
+        # Simulates a binding that predates the set_chat_binding-level enforcement (or was
+        # hand-edited) — dispatch_authors is set but dispatch_workdir is not. The runtime
+        # check in dispatch_to_bead is the defensive backstop for that case.
+        config = common.load_config()
+        binding_id = common.chat_binding_id("room", "22")
+        config.setdefault("chat", {}).setdefault("bindings", {})[binding_id] = {
+            "id": binding_id,
+            "kind": "room",
+            "conversation_id": "22",
+            "guild_id": "1",
+            "session_names": ["sky"],
+            "dispatch_authors": ["9001"],
+        }
+        common.save_config(config)
+        common.save_bot_token("bot-token")
+        message = {
+            "id": "607",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "<@999> do the thing",
+            "mentions": [{"id": "999"}],
+            "author": {"id": "9001", "username": "austin"},
+        }
+
+        with mock.patch.object(gateway_service.subprocess, "run") as run_mock, mock.patch.object(
+            common, "post_channel_message"
+        ) as post_channel_message, mock.patch.object(common, "discord_api_request", return_value=[]):
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "failed_dispatch")
+        run_mock.assert_not_called()
+        post_channel_message.assert_called_once()
+        self.assertEqual(
+            post_channel_message.call_args.args[1], "could not file a bead: dispatch_workdir is not configured"
+        )
+
+    def test_process_inbound_routed_author_duplicate_delivery_files_only_one_bead(self) -> None:
+        common.set_chat_binding(
+            common.load_config(),
+            "room",
+            "22",
+            ["sky"],
+            guild_id="1",
+            dispatch_authors=["9001"],
+            dispatch_workdir="/repo/sysadmin",
+        )
+        common.save_bot_token("bot-token")
+        message = {
+            "id": "608",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "<@999> do the thing",
+            "mentions": [{"id": "999"}],
+            "author": {"id": "9001", "username": "austin"},
+        }
+
+        def fake_run(argv, cwd=None, env=None, timeout=None, capture_output=None, text=None):
+            if argv[:2] == ["bd", "create"]:
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"id": "sys-dup1"}), stderr="")
+            if argv[:2] == ["bd", "tag"]:
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if argv[:2] == ["gc", "sling"]:
+                return subprocess.CompletedProcess(argv, 0, stdout='{"admitted": true}', stderr="")
+            raise AssertionError(f"unexpected subprocess call: {argv}")
+
+        with mock.patch.object(gateway_service.subprocess, "run", side_effect=fake_run) as run_mock, mock.patch.object(
+            common, "post_channel_message"
+        ) as post_channel_message, mock.patch.object(common, "discord_api_request", return_value=[]):
+            first_outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+            second_outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(first_outcome["status"], "dispatched")
+        self.assertEqual(second_outcome["status"], "duplicate")
+        # bd create/tag/dispatch ran exactly once across both deliveries of the same
+        # Discord message id; the ingress dedupe (keyed on message id) short-circuits the
+        # second delivery before it ever reaches the dispatch-author branch.
+        create_calls = [call for call in run_mock.call_args_list if call.args[0][:2] == ["bd", "create"]]
+        self.assertEqual(len(create_calls), 1)
+        post_channel_message.assert_called_once()
 
     def test_process_inbound_routed_author_bd_create_failure_acks_and_stops(self) -> None:
         common.set_chat_binding(
@@ -2166,9 +2252,9 @@ class DiscordGatewayServiceTests(unittest.TestCase):
             "filed sys-xyz; fix dispatch failed: refused: bead is not claimable",
         )
         create_call = run_mock.call_args_list[0]
-        title = create_call.args[0][create_call.args[0].index("--title") + 1]
+        title = self._bd_create_flag_value(create_call.args[0], "--title")
         self.assertEqual(title, "do the thing")  # the "fix:" prefix is stripped from the title only
-        description = create_call.args[0][create_call.args[0].index("--description") + 1]
+        description = self._bd_create_flag_value(create_call.args[0], "--description")
         self.assertIn("fix: do the thing", description)  # the envelope/body keeps the original text
         dispatch_call = run_mock.call_args_list[3]
         self.assertEqual(dispatch_call.args[0], ["./bin/tools", "dispatch", "sys-xyz"])
@@ -2211,7 +2297,7 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         self.assertEqual(outcome["seam"], "ops")
         create_call = run_mock.call_args_list[0]
         self.assertEqual(
-            create_call.args[0][create_call.args[0].index("--title") + 1], "restart the pihole exporter"
+            self._bd_create_flag_value(create_call.args[0], "--title"), "restart the pihole exporter"
         )
         dispatch_call = run_mock.call_args_list[3]
         self.assertEqual(
@@ -2234,6 +2320,55 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         # with the body returned untouched.
         self.assertEqual(gateway_service.parse_dispatch_seam("just do it"), ("recon", "just do it"))
         self.assertEqual(gateway_service.parse_dispatch_seam("fixing this now"), ("recon", "fixing this now"))
+
+    def test_dispatch_safe_flag_value_guards_a_leading_dash(self) -> None:
+        self.assertEqual(gateway_service.dispatch_safe_flag_value("normal text"), "normal text")
+        self.assertEqual(gateway_service.dispatch_safe_flag_value("--priority=0 pwn"), " --priority=0 pwn")
+        self.assertEqual(gateway_service.dispatch_safe_flag_value("-x"), " -x")
+
+    def test_process_inbound_routed_author_title_starting_with_dashes_cannot_inject_a_flag(self) -> None:
+        common.set_chat_binding(
+            common.load_config(),
+            "room",
+            "22",
+            ["sky"],
+            guild_id="1",
+            dispatch_authors=["9001"],
+            dispatch_workdir="/repo/sysadmin",
+        )
+        common.save_bot_token("bot-token")
+        message = {
+            "id": "606",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "<@999> --priority=0 pwn the bead tracker",
+            "mentions": [{"id": "999"}],
+            "author": {"id": "9001", "username": "austin"},
+        }
+
+        def fake_run(argv, cwd=None, env=None, timeout=None, capture_output=None, text=None):
+            if argv[:2] == ["bd", "create"]:
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"id": "sys-dash1"}), stderr="")
+            if argv[:2] == ["bd", "tag"]:
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if argv[:2] == ["gc", "sling"]:
+                return subprocess.CompletedProcess(argv, 0, stdout='{"admitted": true}', stderr="")
+            raise AssertionError(f"unexpected subprocess call: {argv}")
+
+        with mock.patch.object(gateway_service.subprocess, "run", side_effect=fake_run) as run_mock, mock.patch.object(
+            common, "post_channel_message"
+        ), mock.patch.object(common, "discord_api_request", return_value=[]):
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "dispatched")
+        create_argv = run_mock.call_args_list[0].args[0]
+        # Every argv entry after "bd create" is either a bare short flag or a "--flag=value"
+        # entry — never a standalone value token that bd's parser could misread as a flag.
+        title_entry = next(entry for entry in create_argv if entry.startswith("--title="))
+        description_entry = next(entry for entry in create_argv if entry.startswith("--description="))
+        self.assertEqual(title_entry, "--title= --priority=0 pwn the bead tracker")
+        self.assertTrue(description_entry.startswith("--description="))
+        self.assertNotIn("--priority=0 pwn the bead tracker", create_argv)  # never a bare positional token
 
     def test_process_inbound_ambient_room_message_routes_targeted_alias_without_bot_mention(self) -> None:
         common.set_chat_binding(

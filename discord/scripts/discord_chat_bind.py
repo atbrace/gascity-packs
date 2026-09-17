@@ -112,6 +112,8 @@ def main(argv: list[str]) -> int:
 
     if args.kind != "room" and room_policy:
         raise SystemExit("room policy flags require --kind room")
+    if args.dispatch_authors and not args.dispatch_workdir:
+        raise SystemExit("--dispatch-workdir is required when --dispatch-author is set")
 
     try:
         app_name = common.validate_app_name(args.app)
